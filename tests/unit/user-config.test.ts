@@ -362,3 +362,36 @@ describe('loadUserConfig diagnostics', () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('[terminal] osc-title-tabs (issue #221)', () => {
+  let tmp: string | null = null;
+  afterEach(() => {
+    if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    tmp = null;
+  });
+
+  function write(body: string): string {
+    const p = path.join(os.tmpdir(), `wmux-osc-title-${Date.now()}-${Math.random()}.toml`);
+    fs.writeFileSync(p, body, 'utf8');
+    return p;
+  }
+
+  it('reads the kebab-case spelling', () => {
+    tmp = write('[terminal]\nosc-title-tabs = false\n');
+    const out = loadUserConfig(tmp);
+    expect(out.errors).toEqual([]);
+    expect(out.terminal?.oscTitleTabs).toBe(false);
+  });
+
+  it('reads the camelCase spelling too, like every other terminal key', () => {
+    tmp = write('[terminal]\noscTitleTabs = true\n');
+    expect(loadUserConfig(tmp).terminal?.oscTitleTabs).toBe(true);
+  });
+
+  it('leaves it undefined when absent, so the store default stands', () => {
+    // undefined, not false: the mapper only ever OVERRIDES, and a `[terminal]`
+    // section that says nothing about tabs must not turn the feature off.
+    tmp = write('[terminal]\nfont-size = 14\n');
+    expect(loadUserConfig(tmp).terminal?.oscTitleTabs).toBeUndefined();
+  });
+});

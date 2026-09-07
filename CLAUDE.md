@@ -4,7 +4,7 @@ Electron-based Windows terminal multiplexer for AI agents. TypeScript, React 19,
 
 **Owner**: amirlehmam (GitHub) — speaks French, prefers fast pragmatic solutions, tests live.
 **Repo**: github.com/amirlehmam/wmux | **Site**: wmux.org (Netlify, static from `site/`)
-**Version**: 2.9.3
+**Version**: 2.10.0
 
 ---
 
@@ -101,7 +101,7 @@ docs/             Planning docs
 ### Renderer (`src/renderer/`)
 
 **Components** (in `components/`):
-- `SplitPane/` — PaneWrapper, SplitContainer, SplitDivider, SurfaceTabBar
+- `SplitPane/` — PaneWrapper, SplitContainer, SplitDivider, SurfaceTabBar. `surface-label.ts` is the one tab-caption chain (customTitle → agent spawn label → OSC window title → cwd → shell), and `use-osc-title.ts` is the single reader of that title so the tab bar and the split-drag preview cannot apply the pref gate differently
 - `Terminal/` — TerminalPane, FindBar, CopyMode, NotificationRing, PinnedPrompt, PromptOutline, NewOutputPill (the three prompt-log OVERLAYS, #207 — all `position: absolute` over the xterm container, never flow siblings: a flow sibling is pushed out of the container's `height:100%` box WITHOUT firing the ResizeObserver, so the PTY keeps its old row count and the bottom rows hide underneath, which is issue #82). Also `PromptsPane` — the outline as a `prompts` SURFACE rather than an overlay, and the one file here the #82 warning does NOT apply to, because it owns its whole box instead of floating over somebody else's. It is the same prompt log seen from elsewhere in the split tree, so unlike the overlay it has to be TOLD which terminal it lists: `promptSourceSurface` (the last terminal to hold focus, written by App.tsx) unless a `promptPaneLocks` entry pins it. Focus landing on a non-terminal deliberately does not update that, or clicking into the panel would blank the list the user just clicked on
 - `Browser/` — BrowserPane, AddressBar, AgentBrowserSetup (the `not-installed` vs `no-dashboard` cards — two genuinely different situations, never one card: the second means the agent browser works fine and only its optional viewer is missing)
 - `Sidebar/` — Sidebar, WorkspaceRow, SessionMenu, SidebarResizeHandle
@@ -131,6 +131,7 @@ docs/             Planning docs
 - `settings-slice.ts` — Shortcuts, sidebar prefs, theme
 - `notification-slice.ts` — Notification lifecycle (max 200)
 - `agent-slice.ts` — Agent metadata tracking
+- `osc-title-slice.ts` — surfaceId → the OSC 0/2 window title the pane's program set (#221). Deliberately NOT a `SurfaceRef` field: that type is what goes into `session.json`, so a title parked there restores onto a fresh shell that has set none — a plain `pwsh` pane relabelled with whatever the program that used to live in it was doing last week. A sibling map is live-only by construction rather than by remembering to strip a field in `freezeSurfaceCwds`, `saveCurrentLayoutAsPreset` and `handleSaveSession`. The setter no-ops on an unchanged title (several shells re-emit the same one every prompt) and the producer in `useTerminal.ts` throttles at 200 ms trailing — a spinner-in-the-title emits DISTINCT titles at ~10 Hz, and one store write per change is #141 again. `normalizeOscTitle`'s bidi strip is the load-bearing half, verified against a real xterm rather than read out of its source: xterm removes C0 itself and ABORTS on C1, but passes U+202E straight through, and that one character reorders the whole tab strip
 - `prompt-slice.ts` — Per-surface prompt log (#207). Bounded twice: 200 prompts per surface, 64 surfaces. **Only the facts** — a marker is a live emulator object and lives in `utils/prompt-marks.ts` instead. `line: null` means "not jumpable"; a view must never read it as line 0
 - `prompt-actions.ts` — The three prompt commands as functions of a surface id, because there are two callers (the shortcut table and the command palette) and they were about to disagree. The palette hands every action it does not recognise to a `console.log`, so an action wired only into the keyboard table appears in the palette, is selectable, and silently does nothing
 - `split-utils.ts` — Immutable split tree helpers, plus `buildWorkspaceTree(panes, layout)` (#212): what a NEW workspace opens as. That shape used to be hard-coded in two places that disagreed — the sidebar `+` built a three-pane T, `wmux new-workspace` built one leaf — because `resolveDefaultSplitTree` took the fallback as a PARAMETER each caller filled in differently. It is now a setting with one resolution (a saved default layout first, then the configured count/arrangement), and `buildDefaultSplitTree()` is `buildWorkspaceTree(3, 'grid')` — byte-for-byte the shipped T, which is what lets it replace the old construction rather than sit beside it. `MAX_WORKSPACE_PANES` is a guard, not a limit: the value arrives from a hand-edited TOML file and over the pipe, and every pane it makes is a PTY

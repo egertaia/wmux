@@ -470,6 +470,21 @@ export interface TerminalPrefs {
   cursorStyle: 'block' | 'underline' | 'bar';
   cursorBlink: boolean;
   scrollbackLines: number;
+  /**
+   * Label a terminal tab with the OSC 0/2 window title its program set, when
+   * the tab has no name of its own (issue #221).
+   *
+   * On by default, as in Windows Terminal: with six panes open in one repo,
+   * every tab otherwise reads the same, and Claude Code has been announcing its
+   * conversation title as OSC 2 all along. Off returns every tab to the cwd
+   * basename — worth having for a shell whose profile sets the title to the
+   * full path, which Git for Windows does.
+   *
+   * A NEW pref field, so it needs no `promptDefaultRev`-style promotion: prefs
+   * persist as whole blocks and `{...DEFAULTS, ...stored}` fills an absent key
+   * in. Only CHANGING this default later would reach nobody.
+   */
+  oscTitleTabs: boolean;
   /** User-defined color schemes, addressable by name in per-pane overrides. */
   userColorSchemes: Record<string, UserColorScheme>;
 }
@@ -481,6 +496,7 @@ export const DEFAULT_TERMINAL_PREFS: TerminalPrefs = {
   cursorStyle: 'block',
   cursorBlink: true,
   scrollbackLines: 5000,
+  oscTitleTabs: true,
   userColorSchemes: {},
 };
 

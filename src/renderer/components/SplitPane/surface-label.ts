@@ -24,17 +24,31 @@ function cwdFolderName(cwd: string): string | null {
   return lastSegment || null;
 }
 
+/**
+ * @param oscTitle The OSC 0/2 window title the pane's program last set (issue
+ *   #221), already normalised by `normalizeOscTitle`, or undefined when the
+ *   feature is off or nothing has set one. Ranked BELOW both names a human
+ *   chose — an explicit `rename-surface` and an `agent spawn --label` — and
+ *   above the cwd: it only fills the gap where the tab had no name of its own
+ *   but the program in it has been announcing one all along.
+ */
 export function getSurfaceLabel(
   surface: SurfaceRef,
   agentLabel?: string,
   workspaceShell?: string,
   t: (key: TranslationKey, fallback?: string) => string = identityT,
+  oscTitle?: string,
 ): string {
   if (surface.customTitle) return surface.customTitle;
   if (agentLabel) return agentLabel;
 
   switch (surface.type) {
     case 'terminal': {
+      // Only inside the terminal case, not above the switch: a browser or
+      // markdown tab has no program that could have set a title, so one
+      // arriving for it means something is confused, and the static label is
+      // the answer that cannot be wrong.
+      if (oscTitle) return oscTitle;
       const folder = surface.currentCwd ? cwdFolderName(surface.currentCwd) : null;
       if (folder) return folder;
       // resolvedShell first: it is the concrete executable, so it labels a

@@ -45,7 +45,7 @@ import type {
   SurfaceDragPreviewTarget,
 } from './components/SplitPane/drag-preview-types';
 import { buildSurfaceDragPreview } from './components/SplitPane/surface-drag-preview';
-import { surfaceTerminalRegistry } from './hooks/useTerminal';
+import { forgetSurfaceTitle, surfaceTerminalRegistry } from './hooks/useTerminal';
 import { forgetSurface as forgetPromptLog, recordAgentPrompt } from './utils/prompt-log';
 import { SURFACE_CLOSED_EVENT } from './store/pty-teardown';
 import { followOutputFor, togglePinnedPromptFor, togglePromptOutlineFor } from './store/prompt-actions';
@@ -784,7 +784,7 @@ export default function App() {
     return unsub;
   }, []);
 
-  // Forget a closed surface's prompt log (issue #207).
+  // Forget a closed surface's prompt log (issue #207) and window title (#221).
   //
   // Bound to the destructive-close chokepoint in pty-teardown.ts, not to React
   // unmount: a split-tree restructure unmounts and remounts a pane that is still
@@ -801,6 +801,11 @@ export default function App() {
       if (typeof surfaceId !== 'string' || !surfaceId) return;
       forgetPromptLog(surfaceId);
       useStore.getState().clearPromptsForSurface(surfaceId);
+      // Both halves, in this order: the module map AND its pending throttle
+      // timer first, or a flush already armed re-publishes the title into the
+      // store a moment after the store entry was dropped.
+      forgetSurfaceTitle(surfaceId);
+      useStore.getState().clearOscTitle(surfaceId);
     };
     document.addEventListener(SURFACE_CLOSED_EVENT, handler);
     return () => document.removeEventListener(SURFACE_CLOSED_EVENT, handler);

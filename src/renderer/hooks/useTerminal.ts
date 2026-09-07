@@ -13,6 +13,7 @@ import type { Translator } from '../i18n/core';
 import { collectActiveTerminalSurfaceIds } from '../store/split-utils';
 import { SplitNode, SurfaceId, ThemeConfig, type InsertionResult } from '../../shared/types';
 import { UserColorScheme } from '../store/settings-slice';
+import { normalizeOscTitle } from '../store/osc-title-slice';
 import { terminalBgAlpha } from '../store/backdrop';
 import { activateTerminalLink, terminalLinkHandler } from '../utils/terminal-links';
 import {
@@ -372,24 +373,69 @@ function resolveSurfaceTerminal(surfaceId: string): Terminal | undefined {
  */
 export const surfaceTitle = new Map<string, string>();
 
-/** Longest title kept. A title is chrome; anything longer is a program misusing OSC. */
-const MAX_TITLE_CHARS = 256;
+/**
+ * How long a burst of title changes is coalesced before one store write, in ms.
+ *
+ * Deduping alone is not enough. A program running a spinner in its own title
+ * ("⠋ building", "⠙ building", …) emits DISTINCT titles at ~10 Hz, and the tab
+ * bar subscribes to the store — so one write per change is a re-render of every
+ * subscriber at PTY speed, which is the shape of issue #141. Trailing, so the
+ * value that lands is always the newest one and never a stale frame of the
+ * spinner.
+ *
+ * The detection map above is written on EVERY change, unthrottled: it is a plain
+ * Map that nothing subscribes to, and the detection loop wants the latest fact.
+ */
+const OSC_TITLE_STORE_THROTTLE_MS = 200;
+
+/** surfaceId → its pending trailing-throttle timer, so a burst arms only one. */
+const titleFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * Publish a surface's title into the store, at most once per throttle window.
+ *
+ * The store's own setter no-ops on an unchanged title, so a shell that re-emits
+ * the same title on every prompt costs a timer and nothing else.
+ */
+function publishTitle(surfaceId: string): void {
+  if (titleFlushTimers.has(surfaceId)) return;
+  titleFlushTimers.set(surfaceId, setTimeout(() => {
+    titleFlushTimers.delete(surfaceId);
+    useStore.getState().setOscTitle(surfaceId, surfaceTitle.get(surfaceId) ?? '');
+  }, OSC_TITLE_STORE_THROTTLE_MS));
+}
 
 /**
  * Record OSC 0/2 for a surface. Returns the disposable, or null for a surface
  * with no id.
  *
- * Recorded, not RENDERED: wmux tab titles are the user's to set (renameSurface),
- * and letting any program rewrite them would take that away. The value exists
- * only as detection evidence.
+ * Two consumers now, and the second one is issue #221. It used to be recorded
+ * and never RENDERED, on the reasoning that wmux tab titles are the user's to
+ * set and letting a program rewrite them would take that away. That reasoning
+ * survives intact and is now expressed by the label chain instead: an explicit
+ * `renameSurface` still wins outright, and the title only fills the gap where
+ * the tab had no name of its own — where it beats naming every pane after the
+ * one directory they are all sitting in.
+ *
+ * Normalised on the way IN rather than per consumer, so the detection loop and
+ * the tab bar can never disagree about what the program said.
  */
 function recordTitleChanges(terminal: Terminal, surfaceId: string | undefined) {
   if (!surfaceId) return null;
   return terminal.onTitleChange((title) => {
-    const trimmed = (title ?? '').trim().slice(0, MAX_TITLE_CHARS);
-    if (trimmed) surfaceTitle.set(surfaceId, trimmed);
+    const normalized = normalizeOscTitle(title);
+    if (normalized) surfaceTitle.set(surfaceId, normalized);
     else surfaceTitle.delete(surfaceId);
+    publishTitle(surfaceId);
   });
+}
+
+/** Forget a closed surface's pending title flush, so it cannot resurrect the entry. */
+export function forgetSurfaceTitle(surfaceId: string): void {
+  const timer = titleFlushTimers.get(surfaceId);
+  if (timer) clearTimeout(timer);
+  titleFlushTimers.delete(surfaceId);
+  surfaceTitle.delete(surfaceId);
 }
 
 /**

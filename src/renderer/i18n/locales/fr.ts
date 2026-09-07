@@ -441,6 +441,10 @@ export const fr: Translation = {
   'settings.terminalPanel.cursorStyle.underline': 'Soulignement',
   'settings.terminalPanel.cursorStyle.bar': 'Barre',
   'settings.terminalPanel.cursorBlink': 'Curseur clignotant',
+  'settings.terminalPanel.tabsSection': 'Onglets',
+  'settings.terminalPanel.oscTitleTabs': "Utiliser le titre de fenêtre comme nom d'onglet",
+  'settings.terminalPanel.oscTitleTabsHint':
+    "Nomme un onglet terminal d'après le titre de fenêtre que son programme définit — c'est ainsi que Claude Code annonce le titre de la conversation. Un onglet que vous avez renommé vous-même garde toujours son nom. Désactivez si votre shell met son chemin complet dans le titre.",
   'settings.terminalPanel.scrollbackSection': 'Historique de défilement',
   'settings.terminalPanel.scrollbackLines': "Lignes d'historique",
   'settings.terminalPanel.bg': 'fond',

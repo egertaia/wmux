@@ -10,6 +10,7 @@
  *   cursor-style    = "block"       # block | underline | bar
  *   cursor-blink    = true
  *   scrollback-lines = 10000
+ *   osc-title-tabs  = true        # label a tab with the program's window title (#221)
  *
  *   [terminal.colors]
  *   default = "Dracula"
@@ -75,6 +76,8 @@ export interface UserConfig {
     cursorStyle?: 'block' | 'underline' | 'bar';
     cursorBlink?: boolean;
     scrollbackLines?: number;
+    /** Label a tab with the program's OSC 0/2 window title (issue #221). */
+    oscTitleTabs?: boolean;
     userColorSchemes?: Record<string, UserColorScheme>;
   };
   /** App UI theme (issue #67) — separate from the terminal color scheme. */
@@ -328,6 +331,9 @@ function mapTerminalSection(root: TomlTable, errors: string[]): NonNullable<User
 
   const scrollbackLines = asNumber(terminal['scrollback-lines'] ?? terminal.scrollbackLines);
   if (scrollbackLines !== undefined) t.scrollbackLines = scrollbackLines;
+
+  const oscTitleTabs = asBool(terminal['osc-title-tabs'] ?? terminal.oscTitleTabs);
+  if (oscTitleTabs !== undefined) t.oscTitleTabs = oscTitleTabs;
 
   const colors = asTable(terminal.colors);
   if (colors) mapTerminalColors(t, colors, errors);

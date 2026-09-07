@@ -509,6 +509,10 @@ export const en = {
   'settings.terminalPanel.cursorStyle.underline': 'Underline',
   'settings.terminalPanel.cursorStyle.bar': 'Bar',
   'settings.terminalPanel.cursorBlink': 'Cursor blink',
+  'settings.terminalPanel.tabsSection': 'Tabs',
+  'settings.terminalPanel.oscTitleTabs': 'Use the window title as the tab label',
+  'settings.terminalPanel.oscTitleTabsHint':
+    'Label a terminal tab with the window title its program sets — Claude Code announces the conversation title this way. A tab you renamed yourself always keeps its name. Turn this off if your shell sets the title to its full path.',
   'settings.terminalPanel.scrollbackSection': 'Scrollback',
   'settings.terminalPanel.scrollbackLines': 'Scrollback lines',
   'settings.terminalPanel.bg': 'bg',
