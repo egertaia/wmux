@@ -535,11 +535,38 @@ export default function App() {
   useBlockedAlert(useStore((s) => s.notificationPrefs.taskbarFlash && s.notificationPrefs.agentInputNotify));
   // Shortcut cheat-sheet overlay (issue #64, toggled by F1 via wmux:toggle-cheatsheet).
   const [cheatSheetOpen, setCheatSheetOpen] = useState(false);
+  // Closing the overlay must hand focus back to the terminal it was opened
+  // from. The sheet focuses its own filter box on mount, so without this the
+  // caret is left on <body> and the next keystroke goes nowhere — the user has
+  // to click the pane again. Only reachable now that F1 escapes a focused
+  // terminal at all; before that the overlay could only be opened from
+  // somewhere that was not a terminal.
+  const closeCheatSheet = useCallback(() => {
+    setCheatSheetOpen(false);
+    const st = useStore.getState();
+    const ws = st.workspaces.find((w) => w.id === st.activeWorkspaceId);
+    const leaf = ws && focusedPaneId ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+    const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+    if (surface?.type !== 'terminal') return;
+    // After the overlay unmounts, or the focus lands on an element about to go.
+    requestAnimationFrame(() => {
+      try { surfaceTerminalRegistry.get(surface.id)?.focus(); } catch { /* disposed */ }
+    });
+  }, [focusedPaneId]);
+  // F1 toggles, so it is also the most natural way to CLOSE the sheet — and
+  // that path has to restore focus exactly like the x, the backdrop and Esc do.
+  // A bare `setCheatSheetOpen(o => !o)` here silently skipped closeCheatSheet,
+  // which is why the caret was still stranded on <body> after F1-F1 even with
+  // the focus-return fix in place: every close route was covered except the one
+  // the keyboard user actually takes.
   useEffect(() => {
-    const toggle = () => setCheatSheetOpen((open) => !open);
+    const toggle = () => {
+      if (cheatSheetOpen) closeCheatSheet();
+      else setCheatSheetOpen(true);
+    };
     document.addEventListener('wmux:toggle-cheatsheet', toggle);
     return () => document.removeEventListener('wmux:toggle-cheatsheet', toggle);
-  }, []);
+  }, [cheatSheetOpen, closeCheatSheet]);
   // Broadcast-input mode banner (issue #64): mirror the runtime store flag.
   const broadcastInputActive = useStore((s) => s.broadcastInputActive);
   // Custom background parallel to theming (issue #89): rendered as a layer
@@ -1697,7 +1724,7 @@ export default function App() {
         />
       )}
 
-      {cheatSheetOpen && <ShortcutCheatSheet onClose={() => setCheatSheetOpen(false)} />}
+      {cheatSheetOpen && <ShortcutCheatSheet onClose={closeCheatSheet} />}
 
       <ConfirmCloseDialog />
       <ConfirmCloseSurfaceDialog />
