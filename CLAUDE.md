@@ -4,7 +4,7 @@ Electron-based Windows terminal multiplexer for AI agents. TypeScript, React 19,
 
 **Owner**: amirlehmam (GitHub) — speaks French, prefers fast pragmatic solutions, tests live.
 **Repo**: github.com/amirlehmam/wmux | **Site**: wmux.org (Netlify, static from `site/`)
-**Version**: 2.10.0
+**Version**: 2.10.1
 
 ---
 
@@ -116,6 +116,7 @@ docs/             Planning docs
 **Hooks** (in `hooks/`):
 - `useTerminal.ts` — xterm.js lifecycle, PTY connection, OSC notifications, WebGL renderer, OSC 133 prompt marks (#207)
 - `useKeyboardShortcuts.ts` — 54+ shortcut actions, safe interception
+- `utils/shortcut-binding.ts` — `claimsKeyEvent`, the ONE answer to "does wmux take this keystroke?" (#225, 2.10.1). Two callers must agree or a key reaches nobody: the document-level listener in `useKeyboardShortcuts` decides whether to run an action, and `useTerminal`'s xterm custom key handler decides whether to let the event bubble out of the terminal at all — xterm ends every key it handles with `cancel(event, true)`, which is `stopPropagation()`, so a bare `Ctrl+<letter>` (and F1/F3) never reached `document` while a terminal was focused. `SAFE_CTRL_KEYS` (`b d n t w f ,`) lives here too and is load-bearing for the first time: from inside a terminal `Ctrl+D` is split-right, not EOF. A bare printable key is never claimed even if bound, or a rebind to `a` would eat every `a` typed into the shell
 
 **Pipe Bridge** (`pipe-bridge.ts`):
 - Exposes Zustand store operations as `window.__wmux_*` globals
