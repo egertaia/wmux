@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import { IPC_CHANNELS } from '../shared/types';
+import * as os from 'os';
+import { IPC_CHANNELS, type InsertionResult } from '../shared/types';
 
 contextBridge.exposeInMainWorld('wmux', {
   pty: {
@@ -30,11 +31,35 @@ contextBridge.exposeInMainWorld('wmux', {
   },
   system: {
     platform: 'win32' as const,
+    // Home directory, read once at preload time. Exposed as a plain string
+    // rather than an IPC round-trip because the markdown path chip (issue #116)
+    // needs it during render to shorten `C:\Users\me\notes.md` → `~\notes.md`.
+    homeDir: os.homedir(),
+    // `os.release()` verbatim (e.g. '10.0.26200'), read once at preload time.
+    // The renderer needs the Windows build number to hand xterm its ConPTY
+    // compatibility block at Terminal-construction time — an async IPC answer
+    // would arrive after the terminal already existed. See utils/windows-pty.ts.
+    osRelease: os.release(),
     getShells: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_SHELLS),
+    getFonts: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_FONTS) as Promise<string[]>,
     openExternal: (url: string) => ipcRenderer.send(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, url),
     getVersion: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_VERSION),
     toggleDevTools: () => ipcRenderer.send('toggle-devtools'),
     pickFolder: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_PICK_FOLDER),
+    // Restart Explorer with its icon cache cleared (issues #137/#226). Main
+    // puts up the confirm itself — the dialog names the cost (File Explorer
+    // windows close) and the renderer cannot be trusted to have said it.
+    refreshIconCache: (): Promise<{ ran: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_REFRESH_ICON_CACHE),
+    // True exactly once per process, on the first launch after an update that
+    // changed the app icon — the renderer turns it into a bell notification.
+    takeIconChangeNotice: (): Promise<boolean> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_TAKE_ICON_CHANGE_NOTICE),
+    getContextMenu: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU) as Promise<boolean>,
+    setContextMenu: (enabled: boolean, label?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, enabled, label) as Promise<{
+        ok: boolean; enabled: boolean; error?: string;
+      }>,
     getShouldUseDarkColors: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_SHOULD_USE_DARK_COLORS) as Promise<boolean>,
     onNativeThemeUpdated: (callback: (shouldUseDarkColors: boolean) => void) => {
       const handler = (_event: any, shouldUseDarkColors: boolean) => callback(shouldUseDarkColors);
@@ -94,8 +119,44 @@ contextBridge.exposeInMainWorld('wmux', {
       return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_UPDATE, handler);
     },
   },
+  remote: {
+    /**
+     * What should Ctrl+V type into this surface? Main reads its own
+     * clipboard, uploads to the remote host if the pane is inside ssh, and
+     * returns the finished text.
+     */
+    resolvePaste: (surfaceId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.REMOTE_RESOLVE_PASTE, surfaceId) as Promise<InsertionResult>,
+    /**
+     * Same, for files dropped on the pane. Resolve paths here, while the
+     * original DOM File objects are still available. Accepting path strings
+     * from the renderer would turn this into an arbitrary local-file upload
+     * capability if renderer content were ever compromised.
+     */
+    resolveDrop: (surfaceId: string, files: File[], invert: boolean) => {
+      const localPaths: string[] = [];
+      if (Array.isArray(files)) {
+        for (const file of files) {
+          try {
+            const localPath = webUtils.getPathForFile(file);
+            if (localPath) localPaths.push(localPath);
+          } catch {
+            // A forged value is not a dropped File and grants no path.
+          }
+        }
+      }
+      return ipcRenderer.invoke(
+        IPC_CHANNELS.REMOTE_RESOLVE_DROP,
+        surfaceId,
+        localPaths,
+        Boolean(invert),
+      ) as Promise<InsertionResult>;
+    },
+  },
   clipboard: {
-    pasteImage: () => ipcRenderer.invoke('clipboard:paste-image'),
+    // No pasteImage/readFiles: reading the clipboard for a paste is main's
+    // job now (remote.resolvePaste), because only main can act on what it
+    // finds. These remain for copy and older renderer call sites.
     writeText: (text: string) => ipcRenderer.invoke('clipboard:write-text', text),
     readText: () => ipcRenderer.invoke('clipboard:read-text') as Promise<string>,
   },
@@ -112,6 +173,12 @@ contextBridge.exposeInMainWorld('wmux', {
       }
     },
   },
+  // What wmux may write into ~/.claude and ~/.config/opencode (issue #132).
+  // Separate from `settings` because setting it has side effects on disk.
+  integration: {
+    get: (): Promise<unknown> => ipcRenderer.invoke('integration:get'),
+    set: (partial: unknown): Promise<unknown> => ipcRenderer.invoke('integration:set', partial),
+  },
   settings: {
     // Synchronous read so the renderer store can hydrate at module-load time.
     getAllSync: (): Record<string, unknown> => {
@@ -122,6 +189,32 @@ contextBridge.exposeInMainWorld('wmux', {
       }
     },
     set: (key: string, value: unknown) => ipcRenderer.send('settings:set', key, value),
+    // OS display-language list (issue #114) — synchronous for the same reason as
+    // getAllSync: first-launch language detection runs at store-creation time.
+    getPreferredLanguagesSync: (): string[] => {
+      try {
+        const langs = ipcRenderer.sendSync('system:get-preferred-languages-sync');
+        return Array.isArray(langs) ? langs : [];
+      } catch {
+        return [];
+      }
+    },
+    // Community translations from ~/.wmux/locales (issue #147). Synchronous:
+    // the i18n registry is built at module load, before the store reads the
+    // persisted language and validates it against the shipped language set.
+    getUserLocalesSync: (): unknown => {
+      try {
+        return ipcRenderer.sendSync('locales:get-all-sync') ?? { locales: [], errors: [] };
+      } catch {
+        return { locales: [], errors: [] };
+      }
+    },
+  },
+  // Release notes, in the app (issue #211). Deliberately its own namespace
+  // rather than a member of `update`: this answers "what changed", including in
+  // versions already installed, and works fine when there is no update at all.
+  changelog: {
+    get: (opts?: { refresh?: boolean }) => ipcRenderer.invoke(IPC_CHANNELS.CHANGELOG_GET, opts),
   },
   update: {
     getLatest: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_GET_LATEST),
@@ -130,6 +223,17 @@ contextBridge.exposeInMainWorld('wmux', {
       const handler = (_event: any, info: any) => callback(info);
       ipcRenderer.on(IPC_CHANNELS.UPDATE_AVAILABLE, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_AVAILABLE, handler);
+    },
+    // Issue #125 — download and install without leaving the app. Resolves
+    // { handled: false } when this build can't self-update, which is the
+    // renderer's cue to fall back to openRelease().
+    install: (): Promise<{ handled: boolean; reason?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.UPDATE_INSTALL),
+    getState: () => ipcRenderer.invoke(IPC_CHANNELS.UPDATE_GET_STATE),
+    onState: (callback: (state: { phase: string; version: string | null; percent: number; message?: string }) => void) => {
+      const handler = (_event: any, state: any) => callback(state);
+      ipcRenderer.on(IPC_CHANNELS.UPDATE_STATE, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.UPDATE_STATE, handler);
     },
   },
   hook: {
@@ -145,6 +249,39 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.on(IPC_CHANNELS.CLAUDE_ACTIVITY, handler);
       return () => ipcRenderer.removeListener(IPC_CHANNELS.CLAUDE_ACTIVITY, handler);
     },
+  },
+  // Declared agent run state — blocked / working / idle (issue #128).
+  agentState: {
+    onUpdate: (callback: (data: any) => void) => {
+      const handler = (_event: any, data: any) => callback(data);
+      ipcRenderer.on(IPC_CHANNELS.AGENT_STATE, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_STATE, handler);
+    },
+    // The back-channel: answer a blocked pane without switching to it. Returns
+    // { ok } — a refusal (the pane stopped asking, the choice is gone) is a
+    // normal outcome the UI reports, not an exception.
+    answer: (surfaceId: string, choiceId: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_ANSWER, surfaceId, choiceId),
+    // Read-only seed for onUpdate, which is delta-only (see App.tsx).
+    list: (): Promise<any[]> => ipcRenderer.invoke(IPC_CHANNELS.AGENT_STATE_LIST),
+  },
+  // Which agent each surface runs. Carries the derived KIND only; the command
+  // line it came from never leaves the main process (see index.ts).
+  agentIdentity: {
+    onUpdate: (callback: (data: any) => void) => {
+      const handler = (_event: any, data: any) => callback(data);
+      ipcRenderer.on(IPC_CHANNELS.AGENT_IDENTITY, handler);
+      return () => ipcRenderer.removeListener(IPC_CHANNELS.AGENT_IDENTITY, handler);
+    },
+    list: (): Promise<any[]> => ipcRenderer.invoke(IPC_CHANNELS.AGENT_IDENTITY_LIST),
+  },
+  // Screen detection. The renderer owns the loop (that is where the xterm
+  // buffer is) and reports its VERDICT here; the screen text never crosses.
+  agentDetection: {
+    report: (surfaceId: string, result: unknown): void =>
+      ipcRenderer.send(IPC_CHANNELS.AGENT_DETECTION, surfaceId, result),
+    manifests: (): Promise<{ manifests: unknown[]; warnings: string[] }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_DETECTION_MANIFESTS),
   },
   orchestration: {
     onUpdate: (callback: (state: any) => void) => {
@@ -175,6 +312,58 @@ contextBridge.exposeInMainWorld('wmux', {
     // Manual "open markdown file" entry point (issue #54): native file picker +
     // guarded read in the main process. Returns { filePath, content } | { canceled } | { error }.
     openFile: () => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_OPEN_FILE),
+    // Path-aware surfaces (issue #116). readFile backs "reload from disk" and
+    // drag-and-drop onto a markdown pane; reveal/openInApp are the read-only
+    // shell actions on the backing file. All three re-apply the main-process
+    // guards — the path travels renderer→main and is never trusted.
+    readFile: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_READ_FILE, filePath),
+    reveal: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_REVEAL, filePath),
+    openInApp: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_OPEN_IN_APP, filePath),
+    // Edit & save (issue #116, F3). saveFile writes in place and is refused
+    // unless the path is in this window's grant set; saveAs shows a native
+    // dialog, which is both the write target and the consent that mints the
+    // grant. statFile is the cheap "did it change under me?" re-check.
+    statFile: (filePath: string) => ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_STAT_FILE, filePath),
+    saveFile: (filePath: string, content: string, expectedMtimeMs?: number) =>
+      ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_FILE, filePath, content, expectedMtimeMs),
+    saveAs: (content: string, suggestedName?: string, defaultDir?: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.MARKDOWN_SAVE_AS, content, suggestedName, defaultDir),
+  },
+  explorer: {
+    // The renderer sends a surfaceId and a RELATIVE path — never an absolute
+    // one. Main derives the root itself; a renderer-supplied root would not be
+    // a jail, since a compromised renderer would simply pass 'C:\\'.
+    listDir: (surfaceId: string, relPath: string, opts?: { showHidden?: boolean }) =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_LIST_DIR, surfaceId, relPath, opts),
+    // Shell actions on a listed entry. Not the `markdown.*` pair: those are
+    // gated on the markdown extension whitelist and silently reject every
+    // ordinary source file the tree offers.
+    reveal: (surfaceId: string, relPath: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_REVEAL, surfaceId, relPath),
+    openInApp: (surfaceId: string, relPath: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_OPEN_IN_APP, surfaceId, relPath),
+    // Per-file change counts for the tree's +N/-N column. A surfaceId only —
+    // main derives the root and calls the same diff provider the DiffPane uses.
+    diffStats: (surfaceId: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_DIFF_STATS, surfaceId),
+    // The jailed markdown read, which is the one that mints a write grant.
+    // `markdown.readFile` below takes an absolute path and mints nothing.
+    readMarkdown: (surfaceId: string, relPath: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.EXPLORER_READ_MARKDOWN, surfaceId, relPath),
+  },
+  code: {
+    // Same rule as `explorer` above: a surfaceId and a RELATIVE path, never an
+    // absolute one. Reads are jailed to the pane's folder, which is what stands
+    // in for the extension whitelist markdown reads are gated on.
+    readFile: (surfaceId: string, relPath: string) =>
+      ipcRenderer.invoke(IPC_CHANNELS.CODE_READ_FILE, surfaceId, relPath),
+    // Save. `expectedMtimeMs` is the mtime the buffer was READ at, not the time
+    // of the save — main refuses the write if the file moved underneath it,
+    // which next to a working agent is a routine outcome rather than an edge
+    // case. Omitting it does not "force" the write, it removes the only thing
+    // standing between two writers and a silent data loss.
+    writeFile: (surfaceId: string, relPath: string, content: string, expectedMtimeMs?: number) =>
+      ipcRenderer.invoke(IPC_CHANNELS.CODE_WRITE_FILE, surfaceId, relPath, content, expectedMtimeMs),
   },
   diff: {
     getFiles: (cwd: string) => ipcRenderer.invoke(IPC_CHANNELS.DIFF_GET_FILES, cwd),
@@ -190,6 +379,47 @@ contextBridge.exposeInMainWorld('wmux', {
       ipcRenderer.send(IPC_CHANNELS.CDP_ATTACH, webContentsId, surfaceId, workspaceId),
     detach: (webContentsId?: number) => ipcRenderer.send(IPC_CHANNELS.CDP_DETACH, webContentsId),
   },
+  // Which engine backs a browser surface, and the setup flow for the one that
+  // needs an external binary. Separate from `cdp` above: those verbs act on a
+  // surface's engine, these change it.
+  agentBrowser: {
+    /** `{ installed, dashboardAvailable }` — asked whenever a pane enters agent mode. */
+    status: (): Promise<{ installed: boolean; dashboardAvailable: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_STATUS),
+    /**
+     * Start this surface's session. `currentUrl` carries the page the <webview>
+     * was showing so the flip is not a navigation back to nothing.
+     * `{ installed: false }` is a normal answer, not a failure — it is the
+     * renderer's cue to show the setup card.
+     */
+    enable: (
+      surfaceId: string,
+      currentUrl?: string,
+    ): Promise<{ installed: boolean; dashboardUrl?: string; sessionName?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_ENABLE, surfaceId, currentUrl),
+    /** Close the session, returning where it was so `web` can pick up there. Safe to call twice. */
+    disable: (surfaceId: string): Promise<{ url?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_DISABLE, surfaceId),
+    /**
+     * Where the session's Chrome actually is. `{}` when it cannot be read.
+     *
+     * The pane polls this in agent mode because the agent navigates the real
+     * browser on its own, so the last URL the PANE asked for stops being true
+     * the moment it does — and the address bar would go on showing it.
+     */
+    currentUrl: (surfaceId: string): Promise<{ url?: string }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_CURRENT_URL, surfaceId),
+    /**
+     * Navigate an already-live session. Not `enable`: this neither re-acquires
+     * the dashboard nor re-binds the stream, both of which `enable` does and
+     * neither of which navigation needs.
+     */
+    open: (surfaceId: string, url: string): Promise<{ ok: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_OPEN, surfaceId, url),
+    /** Open a terminal pane running the install, so its output is readable. */
+    install: (): Promise<{ started: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.AGENT_BROWSER_INSTALL),
+  },
   window: {
     create: () => ipcRenderer.invoke(IPC_CHANNELS.WINDOW_CREATE),
     close: (id: string) => ipcRenderer.send(IPC_CHANNELS.WINDOW_CLOSE, id),
@@ -198,5 +428,23 @@ contextBridge.exposeInMainWorld('wmux', {
     minimize: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_MINIMIZE),
     maximize: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_MAXIMIZE),
     isMaximized: () => ipcRenderer.invoke(IPC_CHANNELS.WINDOW_IS_MAXIMIZED),
+    // Windows taskbar progress (OSC 9;4 aggregate). value 0-1, or -1 to remove.
+    setProgress: (value: number, mode?: string) =>
+      ipcRenderer.send(IPC_CHANNELS.WINDOW_SET_PROGRESS, value, mode),
+    // Taskbar flash when an agent starts waiting on you. Ignored by main when
+    // this window already has focus.
+    flash: (on: boolean) => ipcRenderer.send(IPC_CHANNELS.WINDOW_FLASH, on),
+    // Window transparency (Win11 acrylic/mica backdrop).
+    setBackdrop: (
+      enabled: boolean,
+      material: 'clear' | 'acrylic' | 'mica',
+    ): Promise<{ needsRestart: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WINDOW_SET_BACKDROP, enabled, material),
+    supportsBackdrop: (): Promise<{ transparency: boolean; materials: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.WINDOW_SUPPORTS_BACKDROP),
+    // For the renderer-drawn caption buttons a frameless window needs.
+    closeSelf: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_CLOSE_SELF),
+    isFrameless: (): Promise<boolean> => ipcRenderer.invoke(IPC_CHANNELS.WINDOW_IS_FRAMELESS),
+    relaunch: () => ipcRenderer.send(IPC_CHANNELS.WINDOW_RELAUNCH),
   },
 });

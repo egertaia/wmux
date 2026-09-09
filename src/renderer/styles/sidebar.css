@@ -1,5 +1,9 @@
 /* Sidebar Container */
 .sidebar {
+  /* Positioning context for .sidebar-resize-handle — without this the
+     absolutely-positioned handle anchors to the viewport instead of the
+     sidebar's right edge, making the sidebar impossible to resize (#107). */
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -77,18 +81,42 @@
   padding-left: 14px;
   border-radius: 6px;
   cursor: pointer;
-  transition: background-color 0.12s ease;
+  transition: background-color 0.12s ease, box-shadow 0.12s ease;
+
+  /* Every accent expression in this row reads one variable. WorkspaceRow
+     overrides it inline with workspace.customColor when the user picked one
+     (issue #10); otherwise the theme accent applies. An inline custom property
+     feeds these rules instead of beating them, which is what lets CSS decide
+     the treatment while the colour still comes from the workspace. */
+  --row-accent: var(--ui-accent);
 }
 
 .workspace-row:hover {
   background: rgba(var(--ui-overlay-rgb), 0.04);
 }
 
-/* No !important: WorkspaceRow sets inline backgroundColor to workspace.customColor
-   when set, otherwise to #0091FF. Inline styles already beat class rules — leaving
-   !important here blocked user-picked colors (issue #10). */
+/* SELECTION IS NOT A FILL.
+   It used to be `background: #0091FF` — an opaque slab that buried the live
+   agent status colours, the per-session tool text and the branch line under one
+   flat plane the moment you clicked a row. Selection is now elevation plus a
+   full-strength accent rail plus a hairline ring, so everything underneath
+   survives being selected. `--fill` below restores the old look for anyone who
+   sets sidebarPrefs.activeTabIndicator back to 'solidFill'. */
 .workspace-row--active {
-  background: #0091FF;
+  background: color-mix(in srgb, var(--row-accent) 14%, var(--ui-bg-3));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--row-accent) 32%, transparent);
+}
+
+/* 15% alpha tint for inactive coloured rows. The previous 5% was
+   indistinguishable from the sidebar background on dark themes (issue #80).
+   Was an inline backgroundColor on WorkspaceRow; now derived from the token. */
+.workspace-row--custom:not(.workspace-row--active) {
+  background: color-mix(in srgb, var(--row-accent) 15%, transparent);
+}
+
+.workspace-row--fill {
+  background: var(--row-accent);
+  box-shadow: none;
 }
 
 /* Left rail indicator */
@@ -100,14 +128,24 @@
   width: 3px;
   height: calc(100% - 10px);
   border-radius: 2px;
-  background: #0091FF;
+  background: var(--row-accent);
   opacity: 0;
   transition: opacity 0.15s ease;
 }
 
-.workspace-row--active .workspace-row__rail {
-  background: rgba(var(--ui-overlay-rgb), 0.5);
+/* The rail is the selection signal, so it shows at full accent strength.
+   Selection used to REPLACE the accent rail with a flat white overlay — the one
+   element that could have carried the colour was the one element that threw it
+   away. A custom-coloured row keeps its rail even when inactive (issue #80),
+   which is what makes the assigned colour legible without any fill. */
+.workspace-row--active .workspace-row__rail,
+.workspace-row--custom .workspace-row__rail {
   opacity: 1;
+}
+
+/* Inside an opaque fill the accent rail would be invisible against itself. */
+.workspace-row--fill .workspace-row__rail {
+  background: rgba(var(--ui-overlay-rgb), 0.5);
 }
 
 /* Title row */
@@ -129,8 +167,14 @@
   line-height: 1.3;
 }
 
+/* Was `color: #ffffff` unconditionally — correct only against an opaque accent
+   fill, and invisible on the light theme once the fill went away. */
 .workspace-row--active .workspace-row__title {
-  color: #ffffff;
+  color: var(--ui-text-primary);
+}
+
+.workspace-row--fill .workspace-row__title {
+  color: var(--ui-accent-contrast);
 }
 
 /* Close button */
@@ -174,7 +218,7 @@
   flex: 1;
   min-width: 0;
   background: rgba(0, 0, 0, 0.3);
-  border: 1px solid #0091FF;
+  border: 1px solid var(--ui-accent);
   border-radius: 3px;
   color: white;
   font-size: 12.5px;
@@ -212,11 +256,26 @@
   color: #4caf50;
 }
 
+/* "Needs you" — a session parked on a human (issue #128). Deliberately NOT
+   amber: amber already means "working", and the whole value of this state is
+   that it reads differently from the panes that are getting on with it. Violet
+   is unused elsewhere in the sidebar vocabulary, so it cannot be confused with
+   running (amber), done (green) or interrupted (red). */
+.workspace-row__status--blocked {
+  color: var(--ui-agent-blocked);
+  font-weight: 600;
+}
+
 .workspace-row__status--interrupted {
   color: #e53935;
 }
 
-.workspace-row--active .workspace-row__status {
+/* THIS was the "it flattens all of it" bug. Selecting a row replaced the
+   status colour — amber running / green done / red interrupted, the whole
+   point of the line — with one flat overlay. Status colours now survive
+   selection; only the opaque-fill variant still has to override them, because
+   there they genuinely would not be readable. */
+.workspace-row--fill .workspace-row__status {
   color: rgba(var(--ui-overlay-rgb), 0.8);
 }
 
@@ -232,7 +291,13 @@
   margin-top: 1px;
 }
 
+/* Selected rows lift the muted lines rather than repainting them, so the
+   hierarchy between title / status / context is preserved on selection. */
 .workspace-row--active .workspace-row__context {
+  color: rgba(var(--ui-overlay-rgb), 0.5);
+}
+
+.workspace-row--fill .workspace-row__context {
   color: rgba(var(--ui-overlay-rgb), 0.65);
 }
 
@@ -248,6 +313,10 @@
 }
 
 .workspace-row--active .workspace-row__meta-line {
+  color: rgba(var(--ui-overlay-rgb), 0.55);
+}
+
+.workspace-row--fill .workspace-row__meta-line {
   color: rgba(var(--ui-overlay-rgb), 0.7);
 }
 
@@ -268,9 +337,13 @@
 
 .workspace-row__pr-status {
   opacity: 0.7;
+  /* The state is stored lowercase (the icon switches on it); the badge has
+     always read in gh's uppercase, so it keeps reading that way. */
+  text-transform: uppercase;
 }
 
-.workspace-row--active .workspace-row__pr {
+/* PR state is colour-coded (open/merged/draft) — same reasoning as __status. */
+.workspace-row--fill .workspace-row__pr {
   color: rgba(var(--ui-overlay-rgb), 0.85);
 }
 
@@ -279,22 +352,26 @@
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #0091FF;
+  background: var(--row-accent, var(--ui-accent));
   display: flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-}
-
-.unread-badge__count {
+  /* Typography lives here, not on a __count child: UnreadBadge renders the
+     number as a bare text node, so the old .unread-badge__count rule never
+     matched anything and the count inherited the row's font size. */
   font-size: 9px;
   font-weight: 600;
-  color: white;
   line-height: 1;
+  color: var(--ui-accent-contrast);
 }
 
-.workspace-row--active .unread-badge {
+/* Only meaningful against an opaque accent fill, where an accent-coloured
+   badge would disappear into its own background. On the default treatment the
+   badge keeps the accent — it is the loudest thing in the row and should be. */
+.workspace-row--fill .unread-badge {
   background: rgba(var(--ui-overlay-rgb), 0.25);
+  color: var(--ui-accent-contrast);
 }
 
 /* Resize handle */
@@ -302,14 +379,15 @@
   position: absolute;
   top: 0;
   right: 0;
-  width: 4px;
+  width: 6px;
   height: 100%;
   cursor: col-resize;
   z-index: 50;
+  transition: background 0.15s;
 }
 
 .sidebar-resize-handle:hover {
-  background: rgba(0, 145, 255, 0.3);
+  background: rgba(var(--ui-accent-rgb), 0.3);
 }
 
 /* Expand strip — shown when sidebar is collapsed */
@@ -329,7 +407,7 @@
   width: 16px;
   background: var(--ui-bg-1);
   color: rgba(var(--ui-overlay-rgb), 0.6);
-  border-right-color: rgba(0, 145, 255, 0.3);
+  border-right-color: rgba(var(--ui-accent-rgb), 0.3);
 }
 
 /* Context menu */
@@ -355,7 +433,7 @@
 }
 
 .workspace-context-menu__item:hover {
-  background: #0091FF;
+  background: var(--ui-accent);
   color: white;
 }
 
@@ -389,8 +467,16 @@
   opacity: 0.5;
 }
 
-.workspace-row--drag-over {
-  box-shadow: 0 -2px 0 0 #0091FF;
+/* The marker names the edge the row will land on. It used to be hardcoded to
+   the top, which described upward moves correctly and downward moves not at all
+   (issue #124). Inset so the marker stays inside the list — an outset bottom
+   rule on the last row would be clipped. */
+.workspace-row--drop-above {
+  box-shadow: inset 0 2px 0 0 var(--ui-accent);
+}
+
+.workspace-row--drop-below {
+  box-shadow: inset 0 -2px 0 0 var(--ui-accent);
 }
 
 /* ─── Context menu (legacy class names used by WorkspaceContextMenu) ── */
@@ -451,7 +537,7 @@
 }
 
 .ctx-menu__rename-input:focus {
-  border-color: #0091FF;
+  border-color: var(--ui-accent);
 }
 
 /* ─── Color submenu ───────────────────────────────────────────────────────── */
@@ -525,6 +611,19 @@
   will-change: opacity;
 }
 
+/* Matches the "Needs you" status text beside it. Without this the two halves of
+   a blocked row disagreed: violet words, grey dot. Slower, wider pulse than
+   running, same as the per-session blocked dot further down. */
+.workspace-row__state-dot--blocked {
+  background: var(--ui-agent-blocked);
+  animation: pulse-blocked-dot 2s ease-in-out infinite;
+  will-change: opacity;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-row__state-dot--blocked { animation: none; }
+}
+
 .workspace-row__state-dot--idle {
   background: #4caf50;
 }
@@ -538,64 +637,120 @@
   50% { opacity: 0.3; }
 }
 
-.workspace-row__agents {
-  color: rgba(0, 145, 255, 0.6);
-}
-
 .workspace-row__hook-activity {
   color: rgba(255, 152, 0, 0.7);
   font-size: 11px;
 }
 
-.workspace-row__claude-activity {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  margin-top: 2px;
+/* ── Agent sub-lines (spec 2026-07-22) ── */
+.workspace-row__agents {
+  overflow: hidden;
+  margin: 1px 0 2px 6px;
+  animation: agent-lines-in 160ms ease-out;
 }
-
-.workspace-row__agent-line {
+@keyframes agent-lines-in {
+  from { max-height: 0; opacity: 0; }
+  to { max-height: 72px; opacity: 1; }
+}
+.workspace-row__agent {
   display: flex;
   align-items: center;
   gap: 4px;
   font-size: 10px;
-  color: rgba(var(--ui-overlay-rgb), 0.5);
-  line-height: 1.3;
+  line-height: 16px;
+  color: var(--ui-text-secondary, #9aa0a6);
+  white-space: nowrap;
 }
-
+.workspace-row__agent--clickable { cursor: pointer; }
+.workspace-row__agent--clickable:hover .workspace-row__agent-name { text-decoration: underline; }
 .workspace-row__agent-dot {
   width: 5px;
   height: 5px;
   border-radius: 50%;
+  background: #e8a33d;
+  animation: pulse-dot 1.2s ease-in-out infinite;
   flex-shrink: 0;
 }
-
-.workspace-row__agent-dot--working {
-  background: #ff9800;
-  animation: pulse-dot 1.2s ease-in-out infinite;
-  will-change: opacity;
+/* Blocked session dot: violet to match the status line, and a slower, wider
+   pulse than the working dot. A working pane's fast flicker says "busy, leave
+   it"; this one says "waiting on you" — different rhythm, different meaning,
+   readable without reading the label. */
+.workspace-row__agent-dot--blocked {
+  background: var(--ui-agent-blocked);
+  animation: pulse-blocked-dot 2s ease-in-out infinite;
 }
-
-.workspace-row__agent-dot--done {
-  background: #4caf50;
+@keyframes pulse-blocked-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(1.5); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .workspace-row__agent-dot--blocked { animation: none; opacity: 1; }
+}
+.workspace-row__session--blocked .workspace-row__agent-detail {
+  color: var(--ui-agent-blocked);
+  opacity: 1;
+}
+/* Answer buttons for a blocked pane (issue #128, the back-channel).
+   Violet, matching the blocked dot and detail text — the whole point of that
+   colour is that "needs you" reads differently from the amber of panes getting
+   on with it, and the thing you click to resolve it belongs to the same signal.
+   They wrap: an agent may declare several answers and the sidebar is narrow. */
+.workspace-row__answers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 0 4px 0;
+  align-items: center;
+}
+.workspace-row__answer {
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(179, 136, 255, 0.45);
+  background: rgba(179, 136, 255, 0.12);
+  color: #d3bcff;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workspace-row__answer:hover:not(:disabled) {
+  background: rgba(179, 136, 255, 0.26);
+  border-color: rgba(179, 136, 255, 0.75);
+  color: #efe6ff;
+}
+.workspace-row__answer:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .workspace-row__agent-name {
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 120px;
+  min-width: 0;
+  flex: 1;
 }
-
-.workspace-row__agent-tokens {
-  color: rgba(var(--ui-overlay-rgb), 0.3);
-  font-size: 9px;
+.workspace-row__agent-detail {
+  margin-left: auto;
   flex-shrink: 0;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
 }
+.workspace-row__agent--done { opacity: 0.55; }
+.workspace-row__agent--done .workspace-row__agent-detail { color: #4caf50; opacity: 1; }
+
+/* ── Per-Claude-session sub-lines (2+ claude panes in one workspace) ── */
+.workspace-row__sessions {
+  animation: none; /* always-on block — the slide-in is for transient agent lines */
+}
+.workspace-row__session--idle { opacity: 0.55; }
+.workspace-row__session--idle .workspace-row__agent-detail { opacity: 0.8; }
 
 .workspace-row__skill {
-  color: rgba(0, 145, 255, 0.5);
+  color: rgba(var(--ui-accent-rgb), 0.5);
   font-size: 10px;
 }
 
@@ -613,6 +768,45 @@
   background: rgba(var(--ui-overlay-rgb), 0.06);
 }
 
+/* ─── OSC 9;4 workspace progress bar ─────────────────────────────────── */
+.workspace-row__progress {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 8px 0 20px;
+}
+.workspace-row__progress-track {
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(var(--ui-overlay-rgb), 0.12);
+  overflow: hidden;
+}
+.workspace-row__progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--ui-accent);
+  transition: width 0.2s ease;
+}
+.workspace-row__progress-fill--s2 { background: #e53935; }
+.workspace-row__progress-fill--s4 { background: #fb8c00; }
+.workspace-row__progress-fill--s3 {
+  width: 100%;
+  background: repeating-linear-gradient(90deg, var(--ui-accent) 0 8px, transparent 8px 16px);
+  animation: workspace-row-progress-slide 1s linear infinite;
+}
+@keyframes workspace-row-progress-slide {
+  from { background-position-x: 0; }
+  to { background-position-x: 16px; }
+}
+.workspace-row__progress-pct {
+  font-size: 10px;
+  min-width: 28px;
+  text-align: right;
+  color: rgba(var(--ui-overlay-rgb), 0.5);
+  font-variant-numeric: tabular-nums;
+}
+
 .sidebar__save-input {
   flex: 1;
   background: rgba(var(--ui-overlay-rgb), 0.08);
@@ -624,7 +818,7 @@
   outline: none;
 }
 .sidebar__save-input:focus {
-  border-color: rgba(0, 145, 255, 0.5);
+  border-color: rgba(var(--ui-accent-rgb), 0.5);
 }
 
 .session-menu {
@@ -640,6 +834,21 @@
   overflow-y: auto;
   z-index: 1000;
   padding: 4px;
+}
+
+.session-menu__save-input {
+  display: block;
+  width: calc(100% - 8px);
+  margin: 4px;
+  box-sizing: border-box;
+}
+
+.session-menu__label {
+  padding: 6px 10px 2px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(var(--ui-overlay-rgb), 0.35);
 }
 
 .session-menu__empty {
@@ -1101,4 +1310,110 @@
 .orch-panel[data-collapsed="true"] .orch-panel__reviewer,
 .orch-panel[data-collapsed="true"] .orch-panel__dismiss {
   display: none;
+}
+
+/* ── Agent roster banner ──────────────────────────────────────────────────
+   "Who needs me?", above the workspace list. Sits in the same slot as the
+   orchestration panel and follows the same contract: auto-hides when there is
+   no agent to talk about, so a user who never runs one never sees it.
+
+   Deliberately two buttons, not one row with a mode: the common gesture is
+   "take me to whoever has waited longest" (one click, no reading), and the
+   list is the escape hatch for when that guess is wrong. */
+.agent-roster {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  margin: 0 8px 6px 8px;
+  border: 1px solid var(--ui-border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--ui-bg-3);
+}
+
+.agent-roster[data-blocked='true'] {
+  border-color: rgba(var(--ui-agent-blocked-rgb), 0.55);
+  background: rgba(var(--ui-agent-blocked-rgb), 0.12);
+}
+
+.agent-roster__main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: none;
+  background: transparent;
+  color: var(--ui-text-secondary);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.agent-roster__main:hover:not(:disabled) {
+  background: rgba(var(--ui-overlay-rgb), 0.06);
+}
+
+/* Nothing is waiting, so there is nowhere to jump — but the row still carries
+   the working count, so it stays visible rather than disappearing mid-run. */
+.agent-roster__main:disabled {
+  cursor: default;
+}
+
+.agent-roster__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e8a33d;
+  flex-shrink: 0;
+}
+
+.agent-roster[data-blocked='true'] .agent-roster__dot {
+  background: var(--ui-agent-blocked);
+  animation: pulse-blocked-dot 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-roster__dot { animation: none; }
+}
+
+.agent-roster__count {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.agent-roster[data-blocked='true'] .agent-roster__count {
+  color: var(--ui-agent-blocked);
+}
+
+.agent-roster__secondary {
+  color: var(--ui-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.agent-roster__dwell {
+  margin-left: auto;
+  padding-left: 6px;
+  color: var(--ui-text-muted);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+.agent-roster__expand {
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  border: none;
+  border-left: 1px solid var(--ui-border);
+  background: transparent;
+  color: var(--ui-text-muted);
+  cursor: pointer;
+}
+
+.agent-roster__expand:hover {
+  background: rgba(var(--ui-overlay-rgb), 0.08);
+  color: var(--ui-text-primary);
 }

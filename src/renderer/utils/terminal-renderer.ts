@@ -1,9 +1,7 @@
 import type { Terminal } from '@xterm/xterm';
-import { CanvasAddon } from '@xterm/addon-canvas';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { forceSyncCursorRendering } from './force-sync-cursor';
 
-export type RendererKind = 'dom' | 'webgl' | 'canvas';
+export type RendererKind = 'dom' | 'webgl';
 
 export interface RendererHandle {
   kind: RendererKind;
@@ -25,23 +23,27 @@ export function getActiveWebglCount(): number {
   return activeWebglCount;
 }
 
+const DOM_RENDERER_HANDLE: RendererHandle = {
+  kind: 'dom',
+  dispose: () => { /* default renderer, nothing to release */ },
+};
+
 /**
  * Attach the best available renderer to a terminal that just became visible.
- * Preference order: WebGL (maintained upstream, correct wide-char/CJK and
- * cursor rendering — the deprecated Canvas addon mispaints rows under load,
- * issues #23/#30) → Canvas with the sync-cursor patch → xterm's default DOM
- * renderer.
+ * Preference order: WebGL → xterm's default DOM renderer. (xterm 6.0 removed
+ * the Canvas addon we previously used as a middle tier — it mispainted
+ * wide-char/CJK rows under load anyway, issues #23/#30.)
  */
 export function attachVisibleRenderer(terminal: Terminal): RendererHandle {
-  if (activeWebglCount >= MAX_WEBGL_TERMINALS) return attachCanvasRenderer(terminal);
+  if (activeWebglCount >= MAX_WEBGL_TERMINALS) return DOM_RENDERER_HANDLE;
 
   let webgl: WebglAddon;
   try {
     webgl = new WebglAddon();
     terminal.loadAddon(webgl);
   } catch (err) {
-    console.warn('[wmux] WebGL renderer unavailable, falling back to Canvas:', err);
-    return attachCanvasRenderer(terminal);
+    console.warn('[wmux] WebGL renderer unavailable, staying on DOM renderer:', err);
+    return DOM_RENDERER_HANDLE;
   }
   activeWebglCount++;
 
@@ -61,33 +63,25 @@ export function attachVisibleRenderer(terminal: Terminal): RendererHandle {
   };
 
   webgl.onContextLoss(() => {
-    // GPU evicted this context (driver reset, context pressure elsewhere…).
-    // Downgrade this terminal to Canvas instead of leaving it frozen.
-    console.warn('[wmux] WebGL context lost, downgrading terminal to Canvas renderer');
+    // GPU evicted this context (driver reset, or context pressure — Chromium
+    // force-loses the oldest WebGL context past its ~16 cap, which happens
+    // exactly when panes are split/resized and several terminals flip visible at
+    // once). Downgrade this terminal to the DOM renderer instead of leaving it
+    // frozen.
+    console.warn('[wmux] WebGL context lost, downgrading terminal to DOM renderer');
     release();
     try { webgl.dispose(); } catch { /* no-op */ }
-    const fallback = attachCanvasRenderer(terminal);
-    handle.kind = fallback.kind;
-    handle.dispose = fallback.dispose;
+    handle.kind = DOM_RENDERER_HANDLE.kind;
+    handle.dispose = DOM_RENDERER_HANDLE.dispose;
+    // Disposing the WebGL addon reactivates xterm's DOM renderer, but nothing
+    // repaints the existing buffer into it — the canvas the lost context left
+    // behind stays blank until the next PTY write, which is the "text disappears
+    // when I resize/split panes" bug. Force a full redraw once the DOM renderer
+    // is live (next frame, so its layout has settled).
+    requestAnimationFrame(() => {
+      try { terminal.refresh(0, terminal.rows - 1); } catch { /* no-op */ }
+    });
   });
 
   return handle;
-}
-
-export function attachCanvasRenderer(terminal: Terminal): RendererHandle {
-  const canvas = new CanvasAddon();
-  try {
-    terminal.loadAddon(canvas);
-    forceSyncCursorRendering(terminal);
-    return {
-      kind: 'canvas',
-      dispose: () => {
-        try { canvas.dispose(); } catch { /* already disposed with terminal */ }
-      },
-    };
-  } catch (err) {
-    console.warn('[wmux] Canvas renderer unavailable, staying on DOM renderer:', err);
-    try { canvas.dispose(); } catch { /* never activated */ }
-    return { kind: 'dom', dispose: () => { /* default renderer, nothing to release */ } };
-  }
 }

@@ -1,11 +1,36 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../../store';
+import { useT } from '../../i18n';
 import { UserColorScheme } from '../../store/settings-slice';
+import { backdropCaps } from '../../utils/backdrop-caps';
+import type { ThemeConfig } from '../../../shared/types';
+
+/** First family of a CSS font stack, unquoted — used to match the picker. */
+function firstFamily(stack: string): string {
+  const first = (stack || '').split(',')[0].trim();
+  return first.replace(/^['"]/, '').replace(/['"]$/, '');
+}
+
+/** Quote a family name for CSS if it needs it (spaces etc.). */
+function cssFamily(name: string): string {
+  return /^[A-Za-z][A-Za-z0-9-]*$/.test(name) ? name : `'${name}'`;
+}
+
+/**
+ * Whether an import is already running. Module scope on purpose — see runImport.
+ */
+let importInFlight = false;
 
 export default function TerminalSettings() {
+  const t = useT();
   const { terminalPrefs, setTerminalPrefs } = useStore();
+  const setAppearancePrefs = useStore((s) => s.setAppearancePrefs);
   const [themes, setThemes] = useState<string[]>(['Monokai']);
   const [newSchemeName, setNewSchemeName] = useState('');
+  // Installed font families for the picker (issue #89) — enumerated by the
+  // main process from the Windows font registry, so users don't have to guess
+  // what to type into the free-text stack field.
+  const [systemFonts, setSystemFonts] = useState<string[]>([]);
 
   // Load the list of bundled themes from the main process on mount so the
   // dropdown reflects actual files in resources/themes/ rather than a stub.
@@ -13,7 +38,13 @@ export default function TerminalSettings() {
     (window as any).wmux?.config?.getThemeList?.().then((list: string[]) => {
       if (Array.isArray(list) && list.length > 0) setThemes(list);
     });
+    (window as any).wmux?.system?.getFonts?.().then((list: string[]) => {
+      if (Array.isArray(list)) setSystemFonts(list);
+    }).catch(() => { /* picker simply stays hidden */ });
   }, []);
+
+  const currentFamily = firstFamily(terminalPrefs.fontFamily);
+  const pickerValue = systemFonts.includes(currentFamily) ? currentFamily : '';
 
   const userSchemeNames = Object.keys(terminalPrefs.userColorSchemes || {});
   const allSchemes = Array.from(new Set([...themes, ...userSchemeNames])).sort((a, b) => a.localeCompare(b));
@@ -45,23 +76,195 @@ export default function TerminalSettings() {
     setTerminalPrefs({ userColorSchemes: next });
   };
 
+  // ── Import an existing terminal's config ───────────────────────────────────
+  // Both parsers have existed in the main process since config-loader.ts was
+  // written, wired through preload and IPC, with nothing in the UI ever calling
+  // them — which is also why the `background-opacity` they parse was never
+  // applied to anything. These two buttons are the missing end of that path.
+  // One click writes seven settings across two slices, one of which asks for a
+  // restart — a lot to land on someone who was aiming at the button beside it,
+  // and not recoverable by hand once their old font size is gone. So each
+  // import parks the exact keys it is about to overwrite and offers them back.
+  //
+  // Both live in the store, not in this component: it unmounts on a tab switch,
+  // and the tab an import sends you to is General, to see the transparency it
+  // just turned on. See ImportUndo in settings-slice for why it is not
+  // persisted beyond the session.
+  const importStatus = useStore((s) => s.importStatus);
+  const importUndo = useStore((s) => s.importUndo);
+  const setImportStatus = useStore((s) => s.setImportStatus);
+  const setImportUndo = useStore((s) => s.setImportUndo);
+
+  const [importing, setImporting] = useState(false);
+
+  const undoImport = () => {
+    if (!importUndo) return;
+    setTerminalPrefs(importUndo.terminal);
+    // Putting windowTransparency back re-runs useWindowTransparency, which
+    // re-derives the restart flag from the window itself — so undoing an
+    // import that turned transparency on also clears the restart banner it
+    // raised, provided the window was never rebuilt in between.
+    setAppearancePrefs(importUndo.appearance);
+    setImportUndo(null);
+    setImportStatus(t('settings.terminalPanel.importReverted', 'Import reverted.'));
+  };
+
+  // Both buttons call this unawaited, and each snapshot is taken after its own
+  // await resolves — so two imports in flight at once would each read prefs the
+  // other had not written yet, and whichever committed last would silently drop
+  // the other's scheme. Not the state flag: two clicks in the same tick both
+  // read a value that has not re-rendered yet. Not a ref either — this panel
+  // unmounts on a tab switch, taking a ref with it, so clicking Import, hopping
+  // to General and back would arm a fresh guard while the first import was
+  // still in flight. The guard has to outlive the component the same way the
+  // undo snapshot does.
+  const runImport = async (source: 'wt' | 'ghostty') => {
+    if (importInFlight) return;
+    importInFlight = true;
+    setImporting(true);
+    try {
+      await doImport(source);
+    } finally {
+      importInFlight = false;
+      setImporting(false);
+    }
+  };
+
+  const doImport = async (source: 'wt' | 'ghostty') => {
+    const config = (window as any).wmux?.config;
+    const theme: ThemeConfig | null = source === 'ghostty'
+      ? await config?.importGhostty?.()
+      : await config?.importWindowsTerminal?.();
+
+    // Null is the parsers' "no config file at the expected path", not an error.
+    if (!theme) {
+      // Nothing was written, so an undo armed by an earlier import still holds.
+      setImportStatus(t('settings.terminalPanel.importNotFound', 'No config found to import.'));
+      return;
+    }
+
+    const name = theme.name || (source === 'ghostty' ? 'Ghostty' : 'Windows Terminal');
+
+    // Read through the store rather than the render closure: the await above
+    // means this handler can outlive the render that created it.
+    const prevTerminal = useStore.getState().terminalPrefs;
+    const prevAppearance = useStore.getState().appearancePrefs;
+    setTerminalPrefs({
+      userColorSchemes: {
+        ...prevTerminal.userColorSchemes,
+        [name]: {
+          background: theme.background,
+          foreground: theme.foreground,
+          cursor: theme.cursor,
+          cursorText: theme.cursorText,
+          selectionBackground: theme.selectionBackground,
+          selectionForeground: theme.selectionForeground,
+          palette: theme.palette,
+        },
+      },
+      theme: name,
+      ...(theme.fontFamily ? { fontFamily: cssFamily(theme.fontFamily) } : {}),
+      ...(theme.fontSize ? { fontSize: theme.fontSize } : {}),
+    });
+
+    // The imported opacity only means something if there is a backdrop behind
+    // the terminal, and the source terminals both mean "let the desktop show
+    // through" by it. So turning it on is part of honouring the import — set
+    // the number alone and it would silently do nothing, which is the exact bug
+    // this path had in the first place.
+    const pct = Math.round(Math.max(0, Math.min(1, theme.backgroundOpacity ?? 1)) * 100);
+    let note = '';
+    if (pct < 100) {
+      // Plain alpha is what both source terminals mean by opacity, and it
+      // needs only DWM — so this is gated on `transparency`, not `materials`.
+      const supported = (await backdropCaps()).transparency;
+      setAppearancePrefs({
+        terminalBgOpacity: pct,
+        ...(supported ? { windowTransparency: true, windowMaterial: 'clear' } : {}),
+      });
+      note = supported
+        ? ` · ${pct}% ${t('settings.terminalPanel.importRestart', '(restart to apply transparency)')}`
+        : ` · ${pct}%`;
+    }
+
+    // Armed here rather than before the writes, because the label it carries
+    // is only complete once the opacity branch above has run.
+    setImportStatus(null);
+    setImportUndo({
+      // The whole userColorSchemes map, not just the imported key: the source
+      // may name a scheme the user already had, and this silently replaces it.
+      terminal: {
+        userColorSchemes: prevTerminal.userColorSchemes,
+        theme: prevTerminal.theme,
+        fontFamily: prevTerminal.fontFamily,
+        fontSize: prevTerminal.fontSize,
+      },
+      appearance: {
+        terminalBgOpacity: prevAppearance.terminalBgOpacity,
+        windowTransparency: prevAppearance.windowTransparency,
+        windowMaterial: prevAppearance.windowMaterial,
+      },
+      label: `${t('settings.terminalPanel.imported', 'Imported')} ${name}${note}`,
+    });
+  };
+
   return (
     <div className="settings-section">
-      <h3 className="settings-section-title">Font</h3>
+      <h3 className="settings-section-title">{t('settings.terminalPanel.font', 'Font')}</h3>
+
+      {systemFonts.length > 0 && (
+        <div className="settings-row">
+          <label className="settings-label">{t('settings.terminalPanel.font', 'Font')}</label>
+          <select
+            className="settings-select"
+            value={pickerValue}
+            onChange={(e) => {
+              const name = e.target.value;
+              if (name) setTerminalPrefs({ fontFamily: `${cssFamily(name)}, Consolas, monospace` });
+            }}
+          >
+            <option value="">{pickerValue
+              ? t('settings.terminalPanel.customStack', 'Custom stack…')
+              : t('settings.terminalPanel.pickInstalledFont', 'Pick an installed font ({count})…').replace('{count}', String(systemFonts.length))}</option>
+            {systemFonts.map((f) => (
+              <option key={f} value={f}>{f}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       <div className="settings-row">
-        <label className="settings-label">Font family</label>
+        <label className="settings-label">{t('settings.terminalPanel.fontStackAdvanced', 'Font stack (advanced)')}</label>
         <input
           type="text"
           className="settings-input"
           value={terminalPrefs.fontFamily}
           onChange={(e) => setTerminalPrefs({ fontFamily: e.target.value })}
-          placeholder="e.g. Consolas, Menlo, monospace"
+          placeholder={t('settings.terminalPanel.fontStackPlaceholder', 'e.g. Consolas, Menlo, monospace')}
         />
       </div>
 
+      {/* Live preview in the selected font, so a pick is verifiable at a glance */}
       <div className="settings-row">
-        <label className="settings-label">Font size</label>
+        <div
+          style={{
+            width: '100%',
+            padding: '6px 10px',
+            borderRadius: 4,
+            border: '1px solid rgba(128,128,128,0.25)',
+            fontFamily: terminalPrefs.fontFamily || 'monospace',
+            fontSize: terminalPrefs.fontSize || 13,
+            opacity: 0.9,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+          }}
+        >
+          {currentFamily || 'monospace'} — 0O 1lI {'{}'} =&gt; -&gt; :: 42
+        </div>
+      </div>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.terminalPanel.fontSize', 'Font size')}</label>
         <input
           type="number"
           className="settings-input settings-input--narrow"
@@ -73,30 +276,57 @@ export default function TerminalSettings() {
       </div>
 
       <div className="settings-divider" />
-      <h3 className="settings-section-title">Color scheme</h3>
+      <h3 className="settings-section-title">{t('settings.terminalPanel.colorSchemeSection', 'Color scheme')}</h3>
 
       <div className="settings-row">
-        <label className="settings-label">Default scheme</label>
+        <label className="settings-label">{t('settings.terminalPanel.defaultScheme', 'Default scheme')}</label>
         <div className="settings-theme-row">
           <select
             className="settings-select"
             value={terminalPrefs.theme}
             onChange={(e) => setTerminalPrefs({ theme: e.target.value })}
           >
-            {allSchemes.map((t) => (
-              <option key={t} value={t}>{t}</option>
+            {allSchemes.map((scheme) => (
+              <option key={scheme} value={scheme}>{scheme}</option>
             ))}
           </select>
         </div>
       </div>
       <div className="settings-row" style={{ opacity: 0.7, fontSize: '12px' }}>
-        Applied to new panes. Override per pane via <code>wmux split --color-scheme NAME</code> or <code>wmux set-color-scheme NAME</code>.
+        {t('settings.terminalPanel.schemeHintPart1', 'Applied to new panes. Override per pane via ')}<code>wmux split --color-scheme NAME</code>{t('settings.terminalPanel.schemeHintPart2', ' or ')}<code>wmux set-color-scheme NAME</code>{t('settings.terminalPanel.schemeHintPart3', '.')}
       </div>
 
       <div className="settings-divider" />
-      <h3 className="settings-section-title">Custom schemes</h3>
+      <h3 className="settings-section-title">{t('settings.terminalPanel.importSection', 'Import')}</h3>
       <div className="settings-row" style={{ opacity: 0.7, fontSize: '12px' }}>
-        Define named overrides (dev / staging / prod). Only the fields you set are overridden; the rest fall back to the bundled base theme.
+        {t('settings.terminalPanel.importHint', 'Bring colors, font and background opacity across from a terminal you already have set up. Saved as a custom scheme and selected.')}
+      </div>
+      <div className="settings-row">
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button className="settings-btn settings-btn--secondary" disabled={importing} onClick={() => runImport('wt')}>
+            {t('settings.terminalPanel.importWt', 'From Windows Terminal')}
+          </button>
+          <button className="settings-btn settings-btn--secondary" disabled={importing} onClick={() => runImport('ghostty')}>
+            {t('settings.terminalPanel.importGhostty', 'From Ghostty')}
+          </button>
+        </div>
+      </div>
+      {importStatus && (
+        <div className="settings-row" style={{ opacity: 0.7, fontSize: '12px' }}>{importStatus}</div>
+      )}
+      {importUndo && (
+        <div className="settings-row" style={{ opacity: 0.7, fontSize: '12px', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span>{importUndo.label}</span>
+          <button className="settings-btn settings-btn--secondary" onClick={undoImport}>
+            {t('settings.terminalPanel.importUndo', 'Undo')}
+          </button>
+        </div>
+      )}
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.terminalPanel.customSchemesSection', 'Custom schemes')}</h3>
+      <div className="settings-row" style={{ opacity: 0.7, fontSize: '12px' }}>
+        {t('settings.terminalPanel.customSchemesHint', 'Define named overrides (dev / staging / prod). Only the fields you set are overridden; the rest fall back to the bundled base theme.')}
       </div>
 
       {userSchemeNames.map((name) => {
@@ -105,21 +335,21 @@ export default function TerminalSettings() {
           <div key={name} className="settings-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <strong>{name}</strong>
-              <button className="settings-btn settings-btn--secondary" onClick={() => removeUserScheme(name)}>Remove</button>
+              <button className="settings-btn settings-btn--secondary" onClick={() => removeUserScheme(name)}>{t('settings.terminalPanel.remove', 'Remove')}</button>
             </div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
               <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                bg
+                {t('settings.terminalPanel.bg', 'bg')}
                 <input type="color" value={scheme.background || '#1e1e1e'}
                   onChange={(e) => updateUserScheme(name, { background: e.target.value })} />
               </label>
               <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                fg
+                {t('settings.terminalPanel.fg', 'fg')}
                 <input type="color" value={scheme.foreground || '#dddddd'}
                   onChange={(e) => updateUserScheme(name, { foreground: e.target.value })} />
               </label>
               <label style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-                cursor
+                {t('settings.terminalPanel.cursorAbbr', 'cursor')}
                 <input type="color" value={scheme.cursor || '#ffffff'}
                   onChange={(e) => updateUserScheme(name, { cursor: e.target.value })} />
               </label>
@@ -132,19 +362,19 @@ export default function TerminalSettings() {
         <input
           type="text"
           className="settings-input"
-          placeholder="new scheme name (e.g. prod)"
+          placeholder={t('settings.terminalPanel.newSchemeNamePlaceholder', 'new scheme name (e.g. prod)')}
           value={newSchemeName}
           onChange={(e) => setNewSchemeName(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') addUserScheme(); }}
         />
-        <button className="settings-btn settings-btn--secondary" onClick={addUserScheme}>Add scheme</button>
+        <button className="settings-btn settings-btn--secondary" onClick={addUserScheme}>{t('settings.terminalPanel.addScheme', 'Add scheme')}</button>
       </div>
 
       <div className="settings-divider" />
-      <h3 className="settings-section-title">Cursor</h3>
+      <h3 className="settings-section-title">{t('settings.terminalPanel.cursorSection', 'Cursor')}</h3>
 
       <div className="settings-row">
-        <label className="settings-label">Cursor style</label>
+        <label className="settings-label">{t('settings.terminalPanel.cursorStyle', 'Cursor style')}</label>
         <select
           className="settings-select"
           value={terminalPrefs.cursorStyle}
@@ -152,14 +382,14 @@ export default function TerminalSettings() {
             setTerminalPrefs({ cursorStyle: e.target.value as 'block' | 'underline' | 'bar' })
           }
         >
-          <option value="block">Block</option>
-          <option value="underline">Underline</option>
-          <option value="bar">Bar</option>
+          <option value="block">{t('settings.terminalPanel.cursorStyle.block', 'Block')}</option>
+          <option value="underline">{t('settings.terminalPanel.cursorStyle.underline', 'Underline')}</option>
+          <option value="bar">{t('settings.terminalPanel.cursorStyle.bar', 'Bar')}</option>
         </select>
       </div>
 
       <div className="settings-row">
-        <label className="settings-label">Cursor blink</label>
+        <label className="settings-label">{t('settings.terminalPanel.cursorBlink', 'Cursor blink')}</label>
         <input
           type="checkbox"
           className="settings-toggle"
@@ -169,10 +399,31 @@ export default function TerminalSettings() {
       </div>
 
       <div className="settings-divider" />
-      <h3 className="settings-section-title">Scrollback</h3>
+      <h3 className="settings-section-title">{t('settings.terminalPanel.tabsSection', 'Tabs')}</h3>
 
       <div className="settings-row">
-        <label className="settings-label">Scrollback lines</label>
+        <label className="settings-label">
+          {t('settings.terminalPanel.oscTitleTabs', 'Use the window title as the tab label')}
+        </label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={terminalPrefs.oscTitleTabs}
+          onChange={(e) => setTerminalPrefs({ oscTitleTabs: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.terminalPanel.oscTitleTabsHint',
+          'Label a terminal tab with the window title its program sets — Claude Code announces the conversation title this way. A tab you renamed yourself always keeps its name. Turn this off if your shell sets the title to its full path.',
+        )}
+      </p>
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.terminalPanel.scrollbackSection', 'Scrollback')}</h3>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.terminalPanel.scrollbackLines', 'Scrollback lines')}</label>
         <input
           type="number"
           className="settings-input settings-input--narrow"

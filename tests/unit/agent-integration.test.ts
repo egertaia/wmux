@@ -1,0 +1,241 @@
+import { describe, it, expect } from 'vitest';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import {
+  applyWmuxHooks,
+  buildChromeDevtoolsMcpServer,
+  CHROME_DEVTOOLS_MCP_PACKAGE,
+  isWmuxAuthoredMcpEntry,
+  removeWmuxHooks,
+  stripWmuxBlock,
+} from '../../src/main/claude-context';
+import {
+  parseConsent,
+  INTEGRATION_CONSENT_DETAIL,
+  INTEGRATION_FEATURES,
+} from '../../src/main/agent-integration';
+
+const HOOK = '/res/cli/wmux-hook.js';
+const require = createRequire(import.meta.url);
+const { buildClaudeArgs, permissionNotice, resolveExecutable } =
+  require('../../resources/wmux-orchestrator/scripts/launch-agent.js') as {
+    buildClaudeArgs: (prompt: string, env?: NodeJS.ProcessEnv) => string[];
+    permissionNotice: (env?: NodeJS.ProcessEnv) => string | null;
+    resolveExecutable: (name: string, env?: NodeJS.ProcessEnv) => string | null;
+  };
+
+// Issue #132: wmux wrote into ~/.claude on every launch with no prompt and no
+// record of a decision, so deleting any of it was futile — the next launch put
+// it straight back. These cover the two halves of the fix: an inverse for every
+// write, and a consent record that fails toward asking rather than assuming.
+
+describe('removeWmuxHooks (issue #132)', () => {
+  it('takes back exactly what applyWmuxHooks installed', () => {
+    const restored = removeWmuxHooks(applyWmuxHooks({}, HOOK));
+    // Not merely "no wmux entries" — an empty `hooks: {}` left behind is still a
+    // footprint in a file wmux was asked to stay out of.
+    expect(restored.hooks).toBeUndefined();
+  });
+
+  it('leaves the user\'s own hooks in place', () => {
+    const userHook = { matcher: 'Bash', hooks: [{ type: 'command', command: 'my-audit.sh' }] };
+    const withBoth = applyWmuxHooks({ hooks: { PostToolUse: [userHook] } }, HOOK);
+    const restored = removeWmuxHooks(withBoth);
+    expect(restored.hooks.PostToolUse).toEqual([userHook]);
+  });
+
+  it('keeps every other setting untouched', () => {
+    const settings = applyWmuxHooks({ model: 'opus', env: { FOO: '1' } }, HOOK);
+    const restored = removeWmuxHooks(settings);
+    expect(restored.model).toBe('opus');
+    expect(restored.env).toEqual({ FOO: '1' });
+  });
+
+  it('is a no-op on settings that never had wmux hooks', () => {
+    const settings = { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'mine.sh' }] }] } };
+    expect(removeWmuxHooks(settings)).toEqual(settings);
+  });
+
+  it('survives settings with no hooks key at all', () => {
+    expect(removeWmuxHooks({ model: 'opus' })).toEqual({ model: 'opus' });
+    expect(removeWmuxHooks({})).toEqual({});
+  });
+
+  it('does not mutate the settings it was given', () => {
+    const settings = applyWmuxHooks({}, HOOK);
+    const before = JSON.stringify(settings);
+    removeWmuxHooks(settings);
+    expect(JSON.stringify(settings)).toBe(before);
+  });
+
+  it('is idempotent — a second launch after declining rewrites nothing', () => {
+    const once = removeWmuxHooks(applyWmuxHooks({}, HOOK));
+    expect(removeWmuxHooks(once)).toEqual(once);
+  });
+});
+
+describe('stripWmuxBlock (issue #132)', () => {
+  const BLOCK = '<!-- wmux:start -->\ninstructions here\n<!-- wmux:end -->';
+
+  it('reports nothing to do when the document has no wmux block', () => {
+    // null, not '' — the caller skips the write entirely rather than rewriting
+    // a file it did not change.
+    expect(stripWmuxBlock('# My notes\n')).toBeNull();
+  });
+
+  it('empties a document that was nothing but the wmux block', () => {
+    // '' is the signal to delete the file: wmux created it, so leaving an empty
+    // CLAUDE.md behind is still a file the user never asked for.
+    expect(stripWmuxBlock(BLOCK)).toBe('');
+  });
+
+  it('keeps the user text that surrounded the block', () => {
+    const out = stripWmuxBlock(`# Mine\n\n${BLOCK}\n\n## Also mine\n`);
+    expect(out).toContain('# Mine');
+    expect(out).toContain('## Also mine');
+    expect(out).not.toContain('wmux:start');
+    expect(out).not.toContain('instructions here');
+  });
+
+  it('does not leave a growing gap where the block was', () => {
+    const out = stripWmuxBlock(`# Mine\n\n${BLOCK}\n\n## Also mine\n`);
+    expect(out).toBe('# Mine\n\n## Also mine\n');
+  });
+
+  it('removes a block whose end marker was lost to a hand-edit', () => {
+    // Matches how ensureClaudeContext repairs the same damage: an unterminated
+    // block is taken to run to end-of-file.
+    expect(stripWmuxBlock('# Mine\n\n<!-- wmux:start -->\ndangling\n')).toBe('# Mine\n');
+  });
+
+  it('is idempotent', () => {
+    const once = stripWmuxBlock(`# Mine\n\n${BLOCK}\n`)!;
+    expect(stripWmuxBlock(once)).toBeNull();
+  });
+});
+
+describe('parseConsent (issue #132)', () => {
+  it('treats a missing record as unset, so the user is asked', () => {
+    expect(parseConsent(undefined).decision).toBe('unset');
+    expect(parseConsent(null).decision).toBe('unset');
+  });
+
+  it('falls back to asking — never to granting — on a corrupt record', () => {
+    // The whole complaint in #132 is wmux writing without being asked. A
+    // settings file that fails to parse must not become a silent yes.
+    expect(parseConsent('garbage').decision).toBe('unset');
+    expect(parseConsent({ decision: 'yes-please' }).decision).toBe('unset');
+    expect(parseConsent(42).decision).toBe('unset');
+  });
+
+  it('round-trips a real decision', () => {
+    expect(parseConsent({ decision: 'granted' }).decision).toBe('granted');
+    expect(parseConsent({ decision: 'declined' }).decision).toBe('declined');
+  });
+
+  it('honours an explicitly disabled feature', () => {
+    const c = parseConsent({ decision: 'granted', features: { hooks: false } });
+    expect(c.features.hooks).toBe(false);
+    expect(c.features.instructions).toBe(true);
+  });
+
+  it('defaults a feature added by a later version to on, not off', () => {
+    // An older record simply lacks the key. Defaulting it to off would silently
+    // withhold a feature the user granted wholesale.
+    const c = parseConsent({ decision: 'granted', features: {} });
+    for (const f of INTEGRATION_FEATURES) expect(c.features[f]).toBe(true);
+  });
+
+  it('ignores a non-boolean feature value rather than trusting it', () => {
+    const c = parseConsent({ decision: 'granted', features: { hooks: 'nope' } });
+    expect(c.features.hooks).toBe(true);
+  });
+});
+
+describe('safe agent integration defaults', () => {
+  it('pins chrome-devtools-mcp to an exact version', () => {
+    expect(CHROME_DEVTOOLS_MCP_PACKAGE).toMatch(/^chrome-devtools-mcp@\d+\.\d+\.\d+$/);
+    expect(CHROME_DEVTOOLS_MCP_PACKAGE).not.toContain('@latest');
+    expect(buildChromeDevtoolsMcpServer()).toEqual({
+      command: 'npx',
+      args: ['-y', CHROME_DEVTOOLS_MCP_PACKAGE, '--browserUrl=http://127.0.0.1:9222'],
+    });
+  });
+
+  it('keeps Claude permission prompts by default', () => {
+    expect(buildClaudeArgs('do the task', {})).toEqual(['--', 'do the task']);
+  });
+
+  it('only bypasses permissions after an explicit opt-in', () => {
+    expect(buildClaudeArgs('do the task', { WMUX_ORCHESTRATOR_SKIP_PERMISSIONS: 'true' }))
+      .toEqual(['--', 'do the task']);
+    expect(buildClaudeArgs('do the task', { WMUX_ORCHESTRATOR_SKIP_PERMISSIONS: '1' }))
+      .toEqual(['--dangerously-skip-permissions', '--', 'do the task']);
+  });
+
+  // The pin is a migration: existing installs carry `@latest` and have to be
+  // moved off it. What must NOT happen is the write path rewriting an entry the
+  // user retuned — uninstall already takes care to leave those alone
+  // (removeChromeDevtoolsConfig), and a plain "is this what I want" inequality
+  // would clobber them on every single launch. That is the issue #132 mistake.
+  it('recognises its own MCP entry across pins, so @latest can be migrated', () => {
+    expect(isWmuxAuthoredMcpEntry(buildChromeDevtoolsMcpServer())).toBe(true);
+    expect(isWmuxAuthoredMcpEntry({
+      command: 'npx',
+      args: ['-y', 'chrome-devtools-mcp@latest', '--browserUrl=http://127.0.0.1:9222'],
+    })).toBe(true);
+  });
+
+  it("leaves an entry it did not write alone", () => {
+    // A different port is the clearest "this is mine, not yours" signal: wmux
+    // only ever aims at its own proxy.
+    expect(isWmuxAuthoredMcpEntry({
+      command: 'npx',
+      args: ['-y', 'chrome-devtools-mcp@1.7.0', '--browserUrl=http://127.0.0.1:9333'],
+    })).toBe(false);
+    // A global install rather than npx.
+    expect(isWmuxAuthoredMcpEntry({
+      command: 'chrome-devtools-mcp',
+      args: ['--browserUrl=http://127.0.0.1:9222'],
+    })).toBe(false);
+    // Something else entirely under the same key.
+    expect(isWmuxAuthoredMcpEntry({ command: 'node', args: ['./my-server.js'] })).toBe(false);
+    for (const junk of [null, undefined, 'npx', 42, {}, { command: 'npx' }]) {
+      expect(isWmuxAuthoredMcpEntry(junk)).toBe(false);
+    }
+  });
+
+  it('tells the user why the worker is asking, unless they opted out', () => {
+    // A silent behaviour change reads as a bug — a wave that used to run
+    // unattended now stops on every Bash call with nothing explaining it.
+    const notice = permissionNotice({});
+    expect(notice).toContain('WMUX_ORCHESTRATOR_SKIP_PERMISSIONS');
+    expect(notice).toContain('answer-agent');
+    expect(permissionNotice({ WMUX_ORCHESTRATOR_SKIP_PERMISSIONS: '1' })).toBeNull();
+  });
+
+  it('resolves the agent to an absolute path instead of trusting PATH at exec time', () => {
+    // Bare-name exec lets any writable directory earlier in PATH shadow the
+    // real binary — unacceptable for the process that is handed a prompt and
+    // told to edit the repo.
+    const dir = path.dirname(process.execPath);
+    const name = path.basename(process.execPath, path.extname(process.execPath));
+    const found = resolveExecutable(name, { PATH: dir, PATHEXT: process.env.PATHEXT });
+    expect(found).toBeTruthy();
+    expect(path.isAbsolute(found as string)).toBe(true);
+
+    expect(resolveExecutable('definitely-not-a-real-agent-xyz', { PATH: dir })).toBeNull();
+    expect(resolveExecutable('anything', { PATH: '' })).toBeNull();
+  });
+
+  it('discloses every hook family and modified plugin path', () => {
+    for (const event of [
+      'PostToolUse', 'Notification', 'Stop', 'SubagentStop',
+      'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'SessionEnd',
+    ]) {
+      expect(INTEGRATION_CONSENT_DETAIL).toContain(event);
+    }
+    expect(INTEGRATION_CONSENT_DETAIL).toContain('~/.config/opencode/plugin/wmux.js');
+    expect(INTEGRATION_CONSENT_DETAIL).toContain('pinned chrome-devtools-mcp');
+  });
+});

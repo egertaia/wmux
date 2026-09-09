@@ -6,23 +6,31 @@ import TerminalSettings from './TerminalSettings';
 import NotificationSettings from './NotificationSettings';
 import BrowserSettings from './BrowserSettings';
 import KeyboardSettings from './KeyboardSettings';
+import PromptSettings from './PromptSettings';
 import QuickLaunchSettings from './QuickLaunchSettings';
 import HelpSettings from './HelpSettings';
-import { useT } from '../../i18n';
+import ChangelogSettings from './ChangelogSettings';
+import { useT, type TranslationKey } from '../../i18n';
 import '../../styles/settings.css';
 
-const TABS = ['General', 'Sidebar', 'Workspace', 'Terminal', 'Notifications', 'Browser', 'Profiles', 'Shortcuts', 'Help'] as const;
+// Changelog sits next to Help (issue #211) — both answer "tell me about wmux
+// itself" rather than "change how wmux behaves", and neither belongs among the
+// preference tabs above them.
+const TABS = ['General', 'Sidebar', 'Workspace', 'Terminal', 'Prompts', 'Notifications', 'Browser', 'Profiles', 'Shortcuts', 'Changelog', 'Help'] as const;
 
-// Map each tab to its i18n key (issue #56). Falls back to the English label.
-const TAB_LABEL_KEYS: Record<typeof TABS[number], string> = {
+// Map each tab to its i18n key (issue #56). Typed as TranslationKey, not
+// string: the lookup is what reaches t(), so the keys are checked here.
+const TAB_LABEL_KEYS: Record<typeof TABS[number], TranslationKey> = {
   General: 'settings.tab.general',
   Sidebar: 'settings.tab.sidebar',
   Workspace: 'settings.tab.workspace',
   Terminal: 'settings.tab.terminal',
+  Prompts: 'settings.tab.prompts',
   Notifications: 'settings.tab.notifications',
   Browser: 'settings.tab.browser',
   Profiles: 'settings.tab.profiles',
   Shortcuts: 'settings.tab.shortcuts',
+  Changelog: 'settings.tab.changelog',
   Help: 'settings.tab.help',
 };
 
@@ -37,7 +45,7 @@ export default function SettingsWindow({ onClose }: SettingsWindowProps) {
   return (
     <div
       className="settings-overlay"
-      onClick={(e) => {
+      onMouseDown={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
     >
@@ -65,10 +73,14 @@ export default function SettingsWindow({ onClose }: SettingsWindowProps) {
             {activeTab === 'Sidebar' && <SidebarSettings />}
             {activeTab === 'Workspace' && <WorkspaceSettings />}
             {activeTab === 'Terminal' && <TerminalSettings />}
+            {activeTab === 'Prompts' && <PromptSettings />}
             {activeTab === 'Notifications' && <NotificationSettings />}
             {activeTab === 'Browser' && <BrowserSettings />}
             {activeTab === 'Profiles' && <QuickLaunchSettings />}
             {activeTab === 'Shortcuts' && <KeyboardSettings />}
+            {/* Mounted only while selected, so opening Settings never fires the
+                GitHub fetch for a user who came here to change their font. */}
+            {activeTab === 'Changelog' && <ChangelogSettings />}
             {activeTab === 'Help' && <HelpSettings />}
           </div>
         </div>

@@ -1,6 +1,16 @@
 import { autoUpdater } from 'electron-updater';
-import { BrowserWindow, dialog } from 'electron';
-import { fetchLatestRelease } from './update-checker';
+import { app, BrowserWindow, dialog } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+import { IPC_CHANNELS } from '../shared/types';
+import { fetchLatestRelease, compareVersions } from './update-checker';
+import {
+  isPortableZipInstall,
+  resolvePortableZipTarget,
+  runPortableZipUpdate,
+  applyStagedPortableUpdate,
+  type StagedZipUpdate,
+} from './zip-updater';
 
 // ── Auto-update hardening (issue #29) ────────────────────────────────────────
 // The old flow auto-downloaded AND silently auto-installed on quit, with no
@@ -15,8 +25,16 @@ import { fetchLatestRelease } from './update-checker';
 //   2. No silent install — autoDownload/autoInstallOnAppQuit are off; the user
 //      must explicitly confirm the install via a dialog.
 //
-// (Signature verification + Authenticode + build provenance are tracked as
-// follow-ups in the issue; they need offline keys / CI changes, not just code.)
+// Authenticode signing is wired in CI (issue #71): release.yml signs wmux.exe
+// via SignPath when the SIGNPATH_* secrets are configured. The publisherName
+// pin was REMOVED from electron-builder.json: SignPath fell back to a
+// self-signed cert, and a pin combined with non-chain-trusted artifacts made
+// every client reject every update (which is why latest.yml was withheld for
+// 0.26–0.31, stranding all installs). Without the pin, NsisUpdater skips
+// Authenticode verification; download integrity comes from the latest.yml
+// sha512, and the quarantine window + explicit install dialog below are the
+// primary client-side controls. Re-add the pin only together with reliable
+// chain-trusted signing.
 
 const DEFAULT_MIN_RELEASE_AGE_DAYS = 3;
 const RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -44,6 +62,266 @@ async function releaseAgeMs(version: string): Promise<number | null> {
 
 let installPrompted = false;
 let missingChannelFileWarned = false;
+let stagedZip: StagedZipUpdate | null = null;
+
+function currentInstallIsPortable(): boolean {
+  if (!app.isPackaged) return false;
+  const exe = app.getPath('exe');
+  if (!exe) return false;
+  return isPortableZipInstall(path.dirname(exe));
+}
+
+// ── In-app install, driven by the badge (issue #125) ─────────────────────────
+// The titlebar badge used to be notify-only: it opened the GitHub release page
+// and left the user to download and run an installer by hand, which read as
+// "Windows doesn't get the real updater". It does — electron-updater was
+// already running, just silently, and the quarantine window meant a freshly
+// published release was days away from downloading. Clicking the badge now
+// drives that same updater directly.
+//
+// The click BYPASSES the quarantine window on purpose. Quarantine exists to
+// stop a malicious release from installing itself before anyone can yank it
+// (issue #29); a user who reads the version and clicks is making that call
+// themselves, and the install still needs the confirmation dialog below.
+// Nothing about the unattended path changes.
+
+export type UpdatePhase = 'idle' | 'checking' | 'downloading' | 'ready' | 'error';
+
+export interface UpdateState {
+  phase: UpdatePhase;
+  version: string | null;
+  /** 0–100 while downloading. */
+  percent: number;
+  message?: string;
+  /**
+   * Whether installing will prompt for administrator rights (issue #167).
+   *
+   * Carried in the state so the badge can say so BEFORE the user commits to a
+   * download, rather than having them discover it at the UAC prompt — or, if
+   * they cannot satisfy it, at a generic updater error.
+   */
+  needsElevation?: boolean;
+}
+
+let state: UpdateState = { phase: 'idle', version: null, percent: 0 };
+// Set while a user-initiated flow owns the download, so the unattended
+// `update-available` handler doesn't start a second one or re-apply quarantine.
+let userDriven = false;
+
+export function getUpdateState(): UpdateState {
+  return state;
+}
+
+function setState(next: Partial<UpdateState>): void {
+  state = { ...state, ...next };
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(IPC_CHANNELS.UPDATE_STATE, state);
+  }
+}
+
+// ── Install-root writability (issue #167) ────────────────────────────────────
+// An update is applied by writing over the install root. Whether this process
+// can do that is not something wmux knew: `canSelfUpdate()` answered
+// "packaged, and not disabled" under a doc comment promising "can actually
+// install an update in place", which is a strictly stronger claim.
+//
+// The gap is reachable by ordinary use, not by anything exotic. `oneClick:
+// false` with `allowToChangeInstallationDirectory: true` and no `perMachine`
+// pin means the scope page is re-offered DURING an update, so a per-user
+// install under %LOCALAPPDATA% — which self-updates with no prompt — becomes a
+// per-machine install under Program Files, which cannot, by one click on a page
+// that reads as "confirm the install location". Nothing announced the change.
+//
+// What is deliberately NOT done here is return false for every non-writable
+// root. That conflates two populations: an admin on a per-machine install, for
+// whom in-place update works today via a UAC prompt, and a non-admin, for whom
+// it does not. Disabling the working path for the first group is a regression,
+// and reliably telling them apart needs an elevation attempt rather than a
+// probe. So the fact is recorded and surfaced instead — the app now knows, the
+// dialog says so, and a failure reports which of the two it was.
+
+let installRootWritable: boolean | null = null;
+
+/** Test seam: forget the cached probe. */
+export function resetInstallRootProbe(): void {
+  installRootWritable = null;
+}
+
+/**
+ * Whether this process can write to the directory an update would replace.
+ *
+ * Probed by actually creating and removing a file rather than by reading ACLs:
+ * on Windows the effective answer depends on the process token, integrity
+ * level, and any redirection in front of the path, and `fs.access` is
+ * documented as unreliable for exactly this question. A write that succeeds is
+ * the only proof that a write will succeed.
+ *
+ * Cached for the process lifetime, which is sound because the thing it depends
+ * on — this process's token — cannot change without a restart.
+ */
+export function isInstallRootWritable(): boolean {
+  if (installRootWritable !== null) return installRootWritable;
+  try {
+    const root = path.dirname(app.getPath('exe'));
+    const probe = path.join(root, `.wmux-write-probe-${process.pid}`);
+    fs.writeFileSync(probe, '');
+    fs.unlinkSync(probe);
+    installRootWritable = true;
+  } catch {
+    installRootWritable = false;
+  }
+  return installRootWritable;
+}
+
+/**
+ * True when applying an update in place will need rights this process does not
+ * currently hold — i.e. Windows will show a UAC prompt, and a user who cannot
+ * satisfy it has no in-app path.
+ *
+ * Only meaningful for a packaged build; an unpackaged dev run has no install
+ * root to speak of and is already excluded by `canSelfUpdate`.
+ */
+export function updateNeedsElevation(): boolean {
+  return app.isPackaged && !isInstallRootWritable();
+}
+
+/**
+ * True when this build has an in-place update path at all.
+ *
+ * Note what this does and does not promise, since the previous comment
+ * over-promised (#167): it means the updater is available and enabled, NOT
+ * that the install will be silent. See `updateNeedsElevation` for that.
+ */
+export function canSelfUpdate(): boolean {
+  return app.isPackaged && !isUpdaterDisabled();
+}
+
+/**
+ * Badge click. Resolves as soon as the flow is under way — download progress
+ * and the ready state arrive over UPDATE_STATE, not on this promise.
+ *
+ * `handled: false` means the caller should fall back to opening the release
+ * page: an unpackaged dev run, the updater kill switch, a release with no
+ * latest.yml, or any updater error. The GitHub link stays the safety net it
+ * always was; it is just no longer the only path.
+ */
+export async function requestUpdateNow(): Promise<{ handled: boolean; reason?: string }> {
+  if (!canSelfUpdate()) return { handled: false, reason: 'not_supported' };
+
+  // Already downloaded — this click is the install confirmation.
+  if (state.phase === 'ready') {
+    if (stagedZip) {
+      setImmediate(() => applyStagedPortableUpdate(stagedZip!));
+      return { handled: true };
+    }
+    setImmediate(() => autoUpdater.quitAndInstall());
+    return { handled: true };
+  }
+  if (state.phase === 'checking' || state.phase === 'downloading') return { handled: true };
+
+  if (currentInstallIsPortable()) {
+    return requestPortableZipUpdate();
+  }
+
+  userDriven = true;
+  setState({ phase: 'checking', percent: 0, message: undefined });
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    const version = result?.updateInfo?.version ?? null;
+    if (!version || compareVersions(version, app.getVersion()) <= 0) {
+      userDriven = false;
+      setState({ phase: 'idle', version: null, percent: 0 });
+      return { handled: false, reason: 'no_update' };
+    }
+    setState({ phase: 'downloading', version, percent: 0 });
+    // Deliberately not awaited: the download can take minutes and the caller is
+    // an IPC round-trip. Progress and completion come over UPDATE_STATE.
+    autoUpdater.downloadUpdate().catch((err) => {
+      userDriven = false;
+      console.error('[updater] user-requested download failed:', err);
+      setState({ phase: 'error', message: String((err as Error)?.message ?? err) });
+    });
+    return { handled: true };
+  } catch (err) {
+    userDriven = false;
+    const reason = isMissingChannelFileError(err) ? 'no_channel_file' : 'error';
+    console.warn(`[updater] user-requested update unavailable (${reason}):`, err);
+    setState({ phase: 'idle', percent: 0 });
+    return { handled: false, reason };
+  }
+}
+
+async function requestPortableZipUpdate(): Promise<{ handled: boolean; reason?: string }> {
+  userDriven = true;
+  stagedZip = null;
+  setState({ phase: 'checking', percent: 0, message: undefined, version: null });
+  try {
+    const target = await resolvePortableZipTarget();
+    setState({ phase: 'downloading', version: target.version, percent: 0 });
+    // Deliberately not awaited: the zip is ~100MB+ and the caller is an IPC
+    // round-trip. Progress and completion come over UPDATE_STATE.
+    runPortableZipUpdate({
+      target,
+      onProgress: (percent) => setState({ phase: 'downloading', version: target.version, percent }),
+    }).then(async (staged) => {
+      stagedZip = staged;
+      userDriven = false;
+      setState({
+        phase: 'ready',
+        version: staged.version,
+        percent: 100,
+        needsElevation: updateNeedsElevation(),
+      });
+      await promptToInstall(staged.version);
+    }).catch((err) => {
+      userDriven = false;
+      stagedZip = null;
+      console.error('[updater] portable zip download failed:', err);
+      setState({ phase: 'error', message: String((err as Error)?.message ?? err) });
+    });
+    return { handled: true };
+  } catch (err) {
+    userDriven = false;
+    stagedZip = null;
+    const code = (err as { code?: string } | undefined)?.code;
+    if (code === 'NO_UPDATE') {
+      setState({ phase: 'idle', version: null, percent: 0 });
+      return { handled: false, reason: 'no_update' };
+    }
+    if (code === 'NO_ZIP_ASSET') {
+      setState({ phase: 'idle', percent: 0 });
+      return { handled: false, reason: 'no_zip_asset' };
+    }
+    console.warn('[updater] portable zip update unavailable:', err);
+    setState({ phase: 'idle', percent: 0 });
+    return { handled: false, reason: 'error' };
+  }
+}
+
+async function promptToInstall(version: string): Promise<void> {
+  if (installPrompted) return;
+  installPrompted = true;
+  const elevationNote = updateNeedsElevation()
+    ? '\n\nThis install is under a directory wmux cannot write to, so Windows ' +
+      'will ask for administrator rights. If you cannot grant them, download ' +
+      'the installer from the releases page instead.'
+    : '';
+  const { response } = await dialog.showMessageBox({
+    type: 'info',
+    buttons: ['Install and restart', 'Later'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'wmux update ready',
+    message: `wmux ${version} has been downloaded.`,
+    detail: 'Review the release notes on GitHub before installing. Install now?' + elevationNote,
+  });
+  if (response === 0) {
+    if (stagedZip) applyStagedPortableUpdate(stagedZip);
+    else autoUpdater.quitAndInstall();
+  } else {
+    installPrompted = false;
+  }
+}
 
 // A release without latest.yml (manual/partial releases, transient GitHub
 // errors) is an expected condition, not a failure — the notify-only checker in
@@ -67,12 +345,25 @@ export function initAutoUpdater(): void {
     return;
   }
 
+  // Zip extracts cannot be replaced by NsisUpdater (issue #96). The GitHub
+  // poller still drives the badge; requestUpdateNow() takes the zip path.
+  if (currentInstallIsPortable()) {
+    console.log('[updater] Portable zip install — skipping NsisUpdater');
+    return;
+  }
+
   // Gate both download and install — nothing happens without passing the
   // quarantine window and an explicit user click.
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
 
+  autoUpdater.on('download-progress', (progress) => {
+    setState({ phase: 'downloading', percent: Math.round(progress?.percent ?? 0) });
+  });
+
   autoUpdater.on('update-available', async (info) => {
+    // A user-initiated flow already owns this update; don't race it.
+    if (userDriven) return;
     try {
       const ageMs = await releaseAgeMs(info.version);
       const minMs = minReleaseAgeMs();
@@ -95,37 +386,31 @@ export function initAutoUpdater(): void {
   autoUpdater.on('update-downloaded', async (info) => {
     // Surface to the renderer (badge), then require an explicit user click to
     // install — never restart-and-replace silently.
-    BrowserWindow.getAllWindows().forEach((win) => {
-      if (!win.isDestroyed()) win.webContents.send('updater:ready', info.version);
+    userDriven = false;
+    setState({
+      phase: 'ready',
+      version: info.version,
+      percent: 100,
+      needsElevation: updateNeedsElevation(),
     });
-
-    if (installPrompted) return;
-    installPrompted = true;
-    const { response } = await dialog.showMessageBox({
-      type: 'info',
-      buttons: ['Install and restart', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
-      title: 'wmux update ready',
-      message: `wmux ${info.version} has been downloaded.`,
-      detail: 'Review the release notes on GitHub before installing. Install now?',
-    });
-    if (response === 0) {
-      autoUpdater.quitAndInstall();
-    } else {
-      installPrompted = false; // allow re-prompting on a later cycle
-    }
+    await promptToInstall(info.version);
   });
 
   autoUpdater.on('error', (err) => {
+    const wasBusy = state.phase === 'checking' || state.phase === 'downloading';
+    userDriven = false;
     if (isMissingChannelFileError(err)) {
       if (!missingChannelFileWarned) {
         missingChannelFileWarned = true;
         console.warn('[updater] latest.yml not found in latest release — update check skipped.');
       }
+      // Nothing to install here; drop back to the notify-only badge rather than
+      // showing the user an error they can do nothing about.
+      if (wasBusy) setState({ phase: 'idle', percent: 0 });
       return;
     }
     console.error('[updater] Auto-updater error:', err);
+    if (wasBusy) setState({ phase: 'error', message: String((err as Error)?.message ?? err) });
   });
 
   // Initial check + periodic re-check so a quarantined release installs once it

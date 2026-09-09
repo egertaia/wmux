@@ -124,4 +124,310 @@ describe('handleVersionChange (issue #35)', () => {
     mod.handleVersionChange('1.0.1');
     expect(mod.loadSession()).toBeNull();
   });
+
+  // Issue #113: an update must never lose the user's arranged tabs. The auto
+  // session is archived as an "Auto-backup vX.Y.Z" named session before being
+  // cleared, and the post-update startup path restores the newest named session.
+  it('archives the auto session as a named backup before clearing it', () => {
+    mod.handleVersionChange('1.0.0');
+    mod.saveSession({
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1200, height: 800 },
+        sidebarWidth: 240,
+        activeWorkspaceId: 'ws-1',
+        workspaces: [
+          { id: 'ws-1', title: 'My Renamed Tab', customColor: '#ff0000', pinned: true, shell: 'pwsh.exe', cwd: 'C:\\proj', splitTree: { type: 'leaf' } },
+          { id: 'ws-2', title: 'Second', pinned: false, shell: 'bash', splitTree: { type: 'leaf' } },
+        ],
+      }],
+    } as any);
+
+    mod.handleVersionChange('1.0.1');
+    expect(mod.loadSession()).toBeNull(); // volatile session still cleared
+
+    const backup = mod.loadNamedSession('Auto-backup v1.0.0');
+    expect(backup).not.toBeNull();
+    expect(backup!.workspaces.map(w => w.title)).toEqual(['My Renamed Tab', 'Second']);
+    expect(backup!.workspaces[0].customColor).toBe('#ff0000');
+    expect(backup!.workspaces[0].cwd).toBe('C:\\proj');
+    expect(backup!.workspaces[1].cwd).toBe(''); // missing cwd normalized to string
+    expect(backup!.sidebarWidth).toBe(240);
+    // It's the newest named session, so the startup fallback will restore it.
+    expect(mod.listNamedSessions()[0].name).toBe('Auto-backup v1.0.0');
+  });
+
+  // Issue #145: "autobackup does its own thing". The backup is what the user
+  // gets restored after an update, so it has to be as complete as the manual
+  // save it stands in for. It used to copy 5 of the 8 fields the auto-save
+  // writes, and the missing browserUrl was visible as every workspace's browser
+  // reverting to the default page on the first launch of a new version.
+  it('carries browser state, width and pinning into the backup', () => {
+    mod.handleVersionChange('1.1.0');
+    mod.saveSession({
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1200, height: 800 },
+        sidebarWidth: 240,
+        activeWorkspaceId: 'ws-1',
+        workspaces: [
+          {
+            id: 'ws-1', title: 'Docs', pinned: true, shell: 'pwsh.exe', cwd: 'C:\\proj',
+            splitTree: { type: 'leaf' },
+            browserUrl: 'https://example.com/dashboard',
+            browserWidth: 640,
+          },
+        ],
+      }],
+    } as any);
+
+    mod.handleVersionChange('1.1.1');
+
+    const ws = mod.loadNamedSession('Auto-backup v1.1.0')!.workspaces[0];
+    expect(ws.browserUrl).toBe('https://example.com/dashboard');
+    expect(ws.browserWidth).toBe(640);
+    expect(ws.pinned).toBe(true);
+  });
+
+  it('normalizes a workspace that never opened a browser', () => {
+    mod.handleVersionChange('1.2.0');
+    mod.saveSession({
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1, height: 1 },
+        sidebarWidth: 200,
+        activeWorkspaceId: 'ws-1',
+        workspaces: [{ id: 'ws-1', title: 'Plain', pinned: false, shell: 'bash', splitTree: {} }],
+      }],
+    } as any);
+    mod.handleVersionChange('1.2.1');
+
+    const ws = mod.loadNamedSession('Auto-backup v1.2.0')!.workspaces[0];
+    expect(ws.browserUrl).toBe('');
+    expect(ws.browserWidth).toBeUndefined();
+    expect(ws.pinned).toBe(false);
+  });
+
+  // Multi-window sessions (issue #118) put each window in its own slot. Backing
+  // up windows[0] alone silently dropped every other window's workspaces on
+  // update — the exact data loss #113 added this backup to prevent.
+  it('backs up every window, not just the first', () => {
+    mod.handleVersionChange('1.3.0');
+    const win = (id: string, titles: string[]) => ({
+      bounds: { x: 0, y: 0, width: 1, height: 1 },
+      sidebarWidth: 260,
+      activeWorkspaceId: id,
+      workspaces: titles.map((title, i) => ({
+        id: `${id}-${i}`, title, pinned: false, shell: 'pwsh.exe', splitTree: {},
+      })),
+    });
+    mod.saveSession({ version: 1, windows: [win('a', ['One', 'Two']), win('b', ['Three'])] } as any);
+
+    mod.handleVersionChange('1.3.1');
+
+    const backup = mod.loadNamedSession('Auto-backup v1.3.0')!;
+    expect(backup.workspaces.map((w) => w.title)).toEqual(['One', 'Two', 'Three']);
+  });
+
+  it('does not create a backup when there is no auto session or it is empty', () => {
+    mod.handleVersionChange('2.0.0'); // no session.json at all
+    expect(mod.listNamedSessions()).toEqual([]);
+
+    mod.saveSession({ version: 1, windows: [{ bounds: { x: 0, y: 0, width: 1, height: 1 }, sidebarWidth: 200, activeWorkspaceId: null, workspaces: [] }] } as any);
+    mod.handleVersionChange('2.0.1');
+    expect(mod.listNamedSessions()).toEqual([]);
+  });
+
+  it('does not touch the last-session pointer and prunes old auto-backups to 3', () => {
+    vi.useFakeTimers();
+    try {
+      mod.handleVersionChange('3.0.0');
+      mod.saveNamedSession({ name: 'Mine', savedAt: 1, workspaces: [] } as any);
+
+      const versions = ['3.0.1', '3.0.2', '3.0.3', '3.0.4', '3.0.5'];
+      for (const v of versions) {
+        vi.advanceTimersByTime(1000); // distinct savedAt per backup for prune ordering
+        mod.saveSession({
+          version: 1,
+          windows: [{ bounds: { x: 0, y: 0, width: 1, height: 1 }, sidebarWidth: 200, activeWorkspaceId: 'w', workspaces: [{ id: 'w', title: 'T', pinned: false, shell: 's', splitTree: {} }] }],
+        } as any);
+        mod.handleVersionChange(v);
+      }
+
+      const names = mod.listNamedSessions().map(s => s.name);
+      const backups = names.filter(n => n.startsWith('Auto-backup'));
+      expect(backups).toHaveLength(3);
+      expect(backups).toEqual(['Auto-backup v3.0.4', 'Auto-backup v3.0.3', 'Auto-backup v3.0.2']);
+      expect(names).toContain('Mine'); // user sessions never pruned
+      expect(mod.getLastSessionName()).toBe('Mine'); // pointer not hijacked by backups
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+// Issue #145 already shipped once as "backupAutoSession copies a subset of
+// fields": browserUrl/browserWidth/pinned were silently dropped. The explorer
+// fields (#Task 4) are the same lifecycle risk, so they get the same coverage.
+// ─────────────────────────────────────────────────────────────────────────────
+// saveSession's atomicity (issue #214).
+//
+// It called itself an atomic write while unlinking the live session.json before
+// renaming the temp over it — a window in which no session file existed. A
+// process that aborts there (the rest of #214) leaves the next launch with
+// nothing to restore, so it comes up as a fresh Session 1 and every pane and
+// surface id is re-minted: "surfaces come back with new ids and lose their
+// customTitle".
+// ─────────────────────────────────────────────────────────────────────────────
+describe('saveSession never leaves the session file missing', () => {
+  const APPDATA_OVERRIDE = path.join(os.tmpdir(), 'wmux-atomic-test-' + process.pid);
+  let mod: typeof import('../../src/main/session-persistence');
+  let savedAppData: string | undefined;
+  const leaf = { type: 'leaf', paneId: 'pane-1', surfaces: [], activeSurfaceIndex: 0 };
+
+  function sessionOf(title: string): any {
+    return {
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1, height: 1 },
+        sidebarWidth: 260,
+        activeWorkspaceId: null,
+        workspaces: [{ id: 'ws-1', title, pinned: false, shell: 'pwsh', splitTree: leaf }],
+      }],
+    };
+  }
+
+  beforeEach(async () => {
+    savedAppData = process.env.APPDATA;
+    process.env.APPDATA = APPDATA_OVERRIDE;
+    delete process.env.WMUX_INSTANCE;
+    vi.resetModules();
+    mod = await import('../../src/main/session-persistence');
+    mod.ensureDirectories();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+    fs.rmSync(APPDATA_OVERRIDE, { recursive: true, force: true });
+  });
+
+  it('overwrites in a single rename, never unlinking the live file first', () => {
+    mod.saveSession(sessionOf('first'));
+    const unlink = vi.spyOn(fs, 'unlinkSync');
+    mod.saveSession(sessionOf('second'));
+    // The one call that would open the window. Its absence IS the fix.
+    expect(unlink).not.toHaveBeenCalledWith(mod.getSessionPath());
+    expect(mod.loadSession()!.windows[0].workspaces[0].title).toBe('second');
+  });
+
+  it('still saves when the target is locked, falling back to unlink + rename', () => {
+    // A sharing violation from antivirus or a sync client holding session.json
+    // open. Not saving at all is worse than a brief window, so the old two-step
+    // survives here — and only here.
+    mod.saveSession(sessionOf('first'));
+    const real = fs.renameSync;
+    let firstAttempt = true;
+    vi.spyOn(fs, 'renameSync').mockImplementation(((from: any, to: any) => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        const err: any = new Error('EPERM: operation not permitted, rename');
+        err.code = 'EPERM';
+        throw err;
+      }
+      return real(from, to);
+    }) as typeof fs.renameSync);
+
+    mod.saveSession(sessionOf('second'));
+    expect(mod.loadSession()!.windows[0].workspaces[0].title).toBe('second');
+  });
+
+  it('leaves the previous session readable when the write fails outright', () => {
+    mod.saveSession(sessionOf('good'));
+    vi.spyOn(fs, 'writeFileSync').mockImplementation((() => {
+      const err: any = new Error('ENOSPC: no space left on device');
+      err.code = 'ENOSPC';
+      throw err;
+    }) as typeof fs.writeFileSync);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => mod.saveSession(sessionOf('doomed'))).not.toThrow();
+    vi.restoreAllMocks();
+    // The point: a failed save costs the user the newest state, not all of it.
+    expect(mod.loadSession()!.windows[0].workspaces[0].title).toBe('good');
+  });
+});
+
+describe('explorer panel state persistence', () => {
+  const APPDATA_OVERRIDE = path.join(os.tmpdir(), 'wmux-explorer-test-' + process.pid);
+  let mod: typeof import('../../src/main/session-persistence');
+  let savedAppData: string | undefined;
+  const leaf = { type: 'leaf', paneId: 'pane-1', surfaces: [], activeSurfaceIndex: 0 };
+
+  beforeEach(async () => {
+    savedAppData = process.env.APPDATA;
+    process.env.APPDATA = APPDATA_OVERRIDE;
+    delete process.env.WMUX_INSTANCE;
+    vi.resetModules();
+    mod = await import('../../src/main/session-persistence');
+    mod.ensureDirectories();
+  });
+
+  afterEach(() => {
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+    fs.rmSync(APPDATA_OVERRIDE, { recursive: true, force: true });
+  });
+
+  it('round-trips explorerOpen, explorerWidth, explorerExpanded and explorerShowHidden', () => {
+    const data: any = {
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1, height: 1 },
+        sidebarWidth: 260,
+        activeWorkspaceId: null,
+        workspaces: [{
+          id: 'ws-1', title: 'ws', pinned: false, shell: 'pwsh', cwd: 'C:\\repo', splitTree: leaf,
+          browserWidth: 420,
+          explorerOpen: true,
+          explorerWidth: 280,
+          explorerExpanded: { 'C:/repo': ['docs', 'docs/nested'] },
+          explorerShowHidden: true,
+        }],
+      }],
+    };
+    mod.saveSession(data);
+    const ws: any = mod.loadSession()!.windows[0].workspaces[0];
+    expect(ws.explorerOpen).toBe(true);
+    expect(ws.explorerWidth).toBe(280);
+    expect(ws.explorerExpanded).toEqual({ 'C:/repo': ['docs', 'docs/nested'] });
+    expect(ws.explorerShowHidden).toBe(true);
+  });
+
+  it('carries the explorer fields through the version-change auto-backup', () => {
+    mod.handleVersionChange('1.13.0'); // establish the version marker
+    mod.saveSession({
+      version: 1,
+      windows: [{
+        bounds: { x: 0, y: 0, width: 1, height: 1 },
+        sidebarWidth: 260,
+        activeWorkspaceId: null,
+        workspaces: [{
+          id: 'ws-1', title: 'ws', pinned: false, shell: 'pwsh', cwd: 'C:\\repo', splitTree: leaf,
+          explorerOpen: true, explorerWidth: 280, explorerExpanded: { 'C:/repo': ['docs'] },
+          explorerShowHidden: true,
+        }],
+      }],
+    } as any);
+
+    mod.handleVersionChange('1.14.0'); // triggers backupAutoSession internally
+
+    const name = mod.listNamedSessions().map(s => s.name).find((n) => n.startsWith('Auto-backup'))!;
+    const ws: any = mod.loadNamedSession(name)!.workspaces[0];
+    expect(ws.explorerOpen).toBe(true);
+    expect(ws.explorerWidth).toBe(280);
+    expect(ws.explorerExpanded).toEqual({ 'C:/repo': ['docs'] });
+    expect(ws.explorerShowHidden).toBe(true);
+  });
 });

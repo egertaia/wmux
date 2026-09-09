@@ -1,23 +1,100 @@
 import { StateCreator } from 'zustand';
 import { v4 as uuid } from 'uuid';
-import { WorkspaceId, WorkspaceInfo, SplitNode } from '../../shared/types';
-import { createLeaf } from './split-utils';
+import { WorkspaceId, WorkspaceInfo, SplitNode, SavedLayout } from '../../shared/types';
+import { isPosixPath } from '../../shared/paths';
+import { buildWorkspaceTree, WorkspaceLayout, instantiateLayout, freezeSurfaceCwds, dropEphemeralSurfaces, dropCodeContent, mergeStartupCommands } from './split-utils';
 import { killTreeTerminalPtys } from './pty-teardown';
+import type { TranslationKey } from '../i18n/core';
+
+/** Defaults to returning the fallback verbatim so callers that omit `t` still see English. */
+type T = (key: TranslationKey, fallback?: string) => string;
+const identityT: T = (_key, fallback) => fallback ?? _key;
+
+// Settings live in a sibling slice; this creator is only typed for its own
+// slice (same reach-across pattern requestCloseWorkspace already uses below
+// for `workspacePrefs`), so pull both out through one cast.
+type SettingsReach = {
+  workspacePrefs?: {
+    defaultLayoutId?: string | null;
+    newWorkspacePanes?: number;
+    newWorkspaceLayout?: WorkspaceLayout;
+  };
+  savedLayouts?: SavedLayout[];
+  setSavedLayouts?: (layouts: SavedLayout[]) => void;
+};
+
+/**
+ * Resolves what a "new workspace" looks like when the caller hasn't supplied
+ * an explicit `splitTree`. Two ranked sources, and no third:
+ *
+ *  1. a saved layout marked default (`workspacePrefs.defaultLayoutId`) — richer,
+ *     since it carries each pane's shell, cwd and startup commands;
+ *  2. otherwise the configured pane count and arrangement (issue #212).
+ *
+ * `fallback` used to default to `createLeaf`, and that default was the bug
+ * #212 reported. Callers disagreed about what a new workspace was: App.tsx
+ * passed `buildDefaultSplitTree` for the sidebar `+`, while `createWorkspace` —
+ * the CLI's path — took the parameter default and made one pane. Same function,
+ * two answers, neither configurable. The parameter is gone: there is now one
+ * answer and it is a setting.
+ */
+export function resolveDefaultSplitTree(get: () => unknown): SplitNode {
+  const settings = get() as SettingsReach;
+  const saved = settings.savedLayouts?.find((l) => l.id === settings.workspacePrefs?.defaultLayoutId);
+  if (saved) return instantiateLayout(saved.splitTree);
+  // A store that has no settings slice at all (a unit test building this slice
+  // on its own) still gets the shipped shape rather than a crash.
+  return buildWorkspaceTree(
+    settings.workspacePrefs?.newWorkspacePanes ?? 3,
+    settings.workspacePrefs?.newWorkspaceLayout ?? 'grid',
+  );
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface WorkspaceSlice {
   workspaces: WorkspaceInfo[];
   activeWorkspaceId: WorkspaceId | null;
+  /**
+   * Sessions queued behind the close-confirmation dialog (issue #90). Non-empty
+   * only while the dialog is up; "Close others" funnels every victim in here so
+   * the user confirms the batch once instead of racing N dialogs. Runtime-only.
+   */
+  pendingCloseWorkspaceIds: WorkspaceId[];
 
-  createWorkspace(options?: Partial<WorkspaceInfo>): WorkspaceId;
+  createWorkspace(options?: Partial<WorkspaceInfo>, t?: T): WorkspaceId;
   closeWorkspace(id: WorkspaceId): void;
+  /**
+   * Close a workspace on behalf of a USER gesture (sidebar ×, context menu,
+   * Ctrl+Shift+W). Honours the opt-in `confirmWorkspaceClose` pref by parking
+   * the id in `pendingCloseWorkspaceIds` for the dialog instead of closing.
+   * Programmatic closes (CLI/agents via pipe-bridge) call closeWorkspace()
+   * directly and never prompt.
+   */
+  requestCloseWorkspace(id: WorkspaceId): void;
+  /** Dialog "Close" button: close everything queued and dismiss. */
+  confirmPendingClose(): void;
+  /** Dialog "Cancel" / Escape: drop the queue, close nothing. */
+  cancelPendingClose(): void;
   selectWorkspace(id: WorkspaceId): void;
   renameWorkspace(id: WorkspaceId, title: string): void;
   reorderWorkspaces(ids: WorkspaceId[]): void;
   updateWorkspaceMetadata(id: WorkspaceId, partial: Partial<WorkspaceInfo>): void;
   updateSplitTree(id: WorkspaceId, tree: SplitNode): void;
-  replaceAllWorkspaces(workspaces: Array<Partial<WorkspaceInfo>>, activeIndex?: number): void;
+  replaceAllWorkspaces(workspaces: Array<Partial<WorkspaceInfo>>, activeIndex?: number, t?: T): void;
+  /**
+   * Snapshot the active workspace's current pane arrangement (geometry, plus
+   * whatever shell/cwd/startupCommands each pane's surface already has) as a
+   * new named entry in `savedLayouts`. Returns the new layout's id, or null
+   * if there's no active workspace.
+   */
+  saveCurrentLayoutAsPreset(name: string): string | null;
+  /**
+   * Overwrite an existing `savedLayouts` entry's geometry with the active
+   * workspace's current arrangement, keeping its id/name in place.
+   * Returns false if there's no active workspace or `id` doesn't exist.
+   */
+  updateLayoutFromCurrent(id: string): boolean;
 }
 
 // ─── Slice creator ───────────────────────────────────────────────────────────
@@ -25,13 +102,14 @@ export interface WorkspaceSlice {
 export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => ({
   workspaces: [],
   activeWorkspaceId: null,
+  pendingCloseWorkspaceIds: [],
 
-  createWorkspace(options = {}): WorkspaceId {
+  createWorkspace(options = {}, t = identityT): WorkspaceId {
     const id: WorkspaceId = `ws-${uuid()}`;
-    const splitTree = options.splitTree ?? createLeaf();
+    const splitTree = options.splitTree ?? resolveDefaultSplitTree(get);
     const workspace: WorkspaceInfo = {
       id,
-      title: options.title ?? `Workspace ${get().workspaces.length + 1}`,
+      title: options.title ?? t('workspace.defaultTitle', 'Workspace {n}').replace('{n}', String(get().workspaces.length + 1)),
       pinned: options.pinned ?? false,
       shell: options.shell || '',
       splitTree,
@@ -40,9 +118,21 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
       gitBranch: options.gitBranch,
       gitDirty: options.gitDirty,
       cwd: options.cwd,
+      // Seed the WSL fallback from the folder the workspace was opened on
+      // ("Open in wmux" on a \\wsl.localhost path, `wmux new-workspace --cwd`,
+      // a restored session). Without this seed a workspace whose only reporting
+      // pane is pwsh would have no POSIX path at all, and its WSL panes would
+      // stay on `--cd ~` for the rest of the session.
+      posixCwd: options.posixCwd ?? (options.cwd && isPosixPath(options.cwd) ? options.cwd : undefined),
       prNumber: options.prNumber,
       prStatus: options.prStatus,
       prLabel: options.prLabel,
+      // No current caller passes PR fields into createWorkspace, so this is
+      // latent — but a workspace created WITH a PR and no recorded owner
+      // would have a badge nothing could ever clear (clear_pr is only
+      // honoured from ws.prSurfaceId; see pr-metadata.ts). Copying it keeps
+      // the PR fields internally consistent regardless.
+      prSurfaceId: options.prSurfaceId,
       ports: options.ports,
       notificationText: options.notificationText,
       shellState: options.shellState,
@@ -88,6 +178,32 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
     });
   },
 
+  requestCloseWorkspace(id: WorkspaceId): void {
+    // The pref lives in the settings slice; the composed store carries both
+    // slices at runtime, but this creator is only typed for its own slice.
+    const prefs = (get() as unknown as { workspacePrefs?: { confirmWorkspaceClose?: boolean } })
+      .workspacePrefs;
+    if (!prefs?.confirmWorkspaceClose) {
+      get().closeWorkspace(id);
+      return;
+    }
+    set((state) => ({
+      pendingCloseWorkspaceIds: state.pendingCloseWorkspaceIds.includes(id)
+        ? state.pendingCloseWorkspaceIds
+        : [...state.pendingCloseWorkspaceIds, id],
+    }));
+  },
+
+  confirmPendingClose(): void {
+    const ids = get().pendingCloseWorkspaceIds;
+    set({ pendingCloseWorkspaceIds: [] });
+    ids.forEach((id) => get().closeWorkspace(id));
+  },
+
+  cancelPendingClose(): void {
+    set({ pendingCloseWorkspaceIds: [] });
+  },
+
   selectWorkspace(id: WorkspaceId): void {
     set({ activeWorkspaceId: id });
   },
@@ -121,18 +237,27 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
     }));
   },
 
-  replaceAllWorkspaces(workspaceConfigs: Array<Partial<WorkspaceInfo>>, activeIndex?: number): void {
+  replaceAllWorkspaces(workspaceConfigs: Array<Partial<WorkspaceInfo>>, activeIndex?: number, t = identityT): void {
     const newWorkspaces: WorkspaceInfo[] = workspaceConfigs.map((config, i) => ({
       id: `ws-${uuid()}` as WorkspaceId,
-      title: config.title ?? `Workspace ${i + 1}`,
+      title: config.title ?? t('workspace.defaultTitle', 'Workspace {n}').replace('{n}', String(i + 1)),
       pinned: config.pinned ?? false,
       shell: config.shell || '',
-      splitTree: config.splitTree ?? createLeaf(),
+      splitTree: config.splitTree ?? resolveDefaultSplitTree(get),
       unreadCount: 0,
       customColor: config.customColor,
       cwd: config.cwd,
+      // Same seed as createWorkspace, which is what repairs a session saved
+      // before this field existed: its workspaces come back with `cwd` already
+      // rewritten to C:\Users\<user> by a pwsh pane, so falling back to `cwd`
+      // when it is POSIX is the only place the project path can still be found.
+      posixCwd: config.posixCwd ?? (config.cwd && isPosixPath(config.cwd) ? config.cwd : undefined),
       browserUrl: config.browserUrl,
       browserWidth: config.browserWidth,
+      explorerOpen: config.explorerOpen,
+      explorerWidth: config.explorerWidth,
+      explorerExpanded: config.explorerExpanded,
+      explorerShowHidden: config.explorerShowHidden,
     }));
 
     // IDs are regenerated above, so a saved activeWorkspaceId is meaningless —
@@ -146,5 +271,52 @@ export const createWorkspaceSlice: StateCreator<WorkspaceSlice> = (set, get) => 
       workspaces: newWorkspaces,
       activeWorkspaceId: newWorkspaces.length > 0 ? newWorkspaces[clampedIndex].id : null,
     });
+  },
+
+  saveCurrentLayoutAsPreset(name: string): string | null {
+    const state = get();
+    const active = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+    if (!active) return null;
+
+    const settings = get() as unknown as SettingsReach;
+    if (!settings.setSavedLayouts) return null;
+
+    const layout: SavedLayout = {
+      id: crypto.randomUUID(),
+      name,
+      // Same live-field sanitizer named-session save uses (App.tsx's
+      // handleSaveSession) — strips nothing but the spawn `cwd`/`currentCwd`
+      // reconciliation, keeps shell/startupCommands/colorScheme as-is.
+      //
+      // dropEphemeralSurfaces is part of that sanitizer, not an extra: a saved
+      // layout is a TEMPLATE, and instantiateLayout spreads every surface field
+      // through, so an explorer preview tab left in here would be reborn — flag,
+      // previewed file and all — in every workspace made from this layout,
+      // forever. That is worse than leaking one into a session, which is why
+      // SurfaceRef.ephemeral says "never persisted" without qualification.
+      splitTree: dropCodeContent(dropEphemeralSurfaces(freezeSurfaceCwds(active.splitTree))),
+      createdAt: Date.now(),
+    };
+    settings.setSavedLayouts([...(settings.savedLayouts ?? []), layout]);
+    return layout.id;
+  },
+
+  updateLayoutFromCurrent(id: string): boolean {
+    const state = get();
+    const active = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
+    if (!active) return false;
+
+    const settings = get() as unknown as SettingsReach;
+    const existing = settings.savedLayouts?.find((l) => l.id === id);
+    if (!settings.setSavedLayouts || !existing) return false;
+
+    // Same pair as saveCurrentLayoutAsPreset above — see the note there for why
+    // an ephemeral surface must never reach a saved layout.
+    const frozen = mergeStartupCommands(
+      dropCodeContent(dropEphemeralSurfaces(freezeSurfaceCwds(active.splitTree))),
+      existing.splitTree,
+    );
+    settings.setSavedLayouts(settings.savedLayouts!.map((l) => (l.id === id ? { ...l, splitTree: frozen } : l)));
+    return true;
   },
 });

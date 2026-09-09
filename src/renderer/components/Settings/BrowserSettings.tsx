@@ -1,14 +1,16 @@
 import { useStore } from '../../store';
+import { useT } from '../../i18n';
 
 export default function BrowserSettings() {
+  const t = useT();
   const { browserPrefs, setBrowserPrefs } = useStore();
 
   return (
     <div className="settings-section">
-      <h3 className="settings-section-title">Search</h3>
+      <h3 className="settings-section-title">{t('settings.browser.searchSection', 'Search')}</h3>
 
       <div className="settings-row">
-        <label className="settings-label">Default search engine</label>
+        <label className="settings-label">{t('settings.browser.defaultSearchEngine', 'Default search engine')}</label>
         <select
           className="settings-select"
           value={browserPrefs.searchEngine}
@@ -26,10 +28,10 @@ export default function BrowserSettings() {
       </div>
 
       <div className="settings-divider" />
-      <h3 className="settings-section-title">Startup</h3>
+      <h3 className="settings-section-title">{t('settings.browser.startupSection', 'Startup')}</h3>
 
       <div className="settings-row">
-        <label className="settings-label">Open browser panel on startup</label>
+        <label className="settings-label">{t('settings.browser.openOnStartup', 'Open browser panel on startup')}</label>
         <input
           type="checkbox"
           className="settings-toggle"
@@ -38,11 +40,72 @@ export default function BrowserSettings() {
         />
       </div>
 
-      <div className="settings-divider" />
-      <h3 className="settings-section-title">Developer Tools</h3>
+      <div className="settings-row">
+        <label className="settings-label" htmlFor="browser-default-url">
+          {t('settings.browser.defaultUrl', 'Start page')}
+        </label>
+        <input
+          id="browser-default-url"
+          type="text"
+          className="settings-input"
+          value={browserPrefs.defaultUrl}
+          onChange={(e) => setBrowserPrefs({ defaultUrl: e.target.value })}
+          placeholder="http://localhost:3000"
+          spellCheck={false}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.browser.defaultUrlHint',
+          'Where a workspace\'s browser panel opens before it has been anywhere. Needs a scheme (http:// or https://). Leave empty for wmux\'s own page. Also settable in ~/.wmux/config.toml as [browser] default-url.',
+        )}
+      </p>
 
       <div className="settings-row">
-        <label className="settings-label">DevTools icon</label>
+        <label className="settings-label">
+          {t('settings.browser.autoOpenDevServer', 'Auto-open dev servers in the browser panel')}
+        </label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={browserPrefs.autoOpenDevServer}
+          onChange={(e) => setBrowserPrefs({ autoOpenDevServer: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.browser.autoOpenDevServerHint',
+          'When on, the browser panel navigates to a dev server (Vite, Next, …) on its own the moment one starts. On by default — turn it off and detected ports are still shown on the workspace row, but nothing opens without you. Also settable in ~/.wmux/config.toml as [browser] auto-open.',
+        )}
+      </p>
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.browser.linksSection', 'Links')}</h3>
+
+      <div className="settings-row">
+        <label className="settings-label">
+          {t('settings.browser.openLinksExternally', 'Open links in the system browser')}
+        </label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={browserPrefs.openLinksExternally}
+          onChange={(e) => setBrowserPrefs({ openLinksExternally: e.target.checked })}
+        />
+      </div>
+
+      <p className="settings-hint">
+        {t(
+          'settings.browser.openLinksExternallyHint',
+          'Clicked links in terminals and markdown go to your default browser instead of the wmux panel. Ctrl+click always does the opposite.',
+        )}
+      </p>
+
+      <div className="settings-divider" />
+      <h3 className="settings-section-title">{t('settings.browser.devToolsSection', 'Developer Tools')}</h3>
+
+      <div className="settings-row">
+        <label className="settings-label">{t('settings.browser.devToolsIcon', 'DevTools icon')}</label>
         <select
           className="settings-select"
           value={browserPrefs.devToolsIcon}
@@ -52,9 +115,9 @@ export default function BrowserSettings() {
             })
           }
         >
-          <option value="default">Default</option>
-          <option value="compact">Compact</option>
-          <option value="hidden">Hidden</option>
+          <option value="default">{t('settings.browser.devToolsIcon.default', 'Default')}</option>
+          <option value="compact">{t('settings.browser.devToolsIcon.compact', 'Compact')}</option>
+          <option value="hidden">{t('settings.browser.devToolsIcon.hidden', 'Hidden')}</option>
         </select>
       </div>
     </div>

@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useStore } from '../../store';
 import { SurfaceId } from '../../../shared/types';
 import { ShortcutAction, ShortcutBinding } from '../../store/settings-slice';
+import { actionLabel } from '../Settings/KeyboardSettings';
+import { instantiateLayout } from '../../store/split-utils';
 import { useT } from '../../i18n';
 import '../../styles/command-palette.css';
 
@@ -29,13 +31,11 @@ function formatBinding(binding: ShortcutBinding): string {
   return parts.join('+');
 }
 
-function actionToLabel(action: ShortcutAction): string {
-  // Convert camelCase action names to readable labels
-  return action
-    .replace(/([A-Z])/g, ' $1')
-    .replace(/^./, (c) => c.toUpperCase())
-    .trim();
-}
+// Labels come from the same map Settings and the F1 cheat-sheet read, so the
+// three views cannot drift and the palette is translated like everything else.
+// It used to de-camelCase the action name locally, which produced English-only
+// labels ("Reset Terminal") in every locale — invisible while the action names
+// happened to read like prose, and wrong the moment one didn't.
 
 function fuzzyMatch(needle: string, haystack: string): boolean {
   if (!needle) return true;
@@ -51,7 +51,10 @@ function fuzzyMatch(needle: string, haystack: string): boolean {
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function CommandPalette({ onClose, onAction }: CommandPaletteProps) {
-  const { shortcuts, workspaces, activeWorkspaceId, selectWorkspace } = useStore();
+  const {
+    shortcuts, workspaces, activeWorkspaceId, selectWorkspace,
+    savedLayouts, createWorkspace, saveCurrentLayoutAsPreset,
+  } = useStore();
   const t = useT();
 
   const [query, setQuery] = useState('');
@@ -70,13 +73,34 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
 
     // Category: Actions — all shortcut actions
     const actionEntries = Object.entries(shortcuts) as [ShortcutAction, ShortcutBinding][];
+    const hubEnabled = useStore.getState().appearancePrefs.hubEnabled;
     for (const [action, binding] of actionEntries) {
+      // The agent-office easter egg stays out of the palette until enabled.
+      if (action === 'openHub' && !hubEnabled) continue;
       items.push({
         id: `action:${action}`,
-        label: actionToLabel(action),
+        label: actionLabel(action, t),
         shortcut: formatBinding(binding),
         category: t('palette.category.actions'),
         action: () => onAction(action),
+      });
+    }
+
+    // Sidebar mode toggle. Deliberately a self-executing Commands-style item
+    // rather than a ShortcutAction: the Actions path in App.tsx is a stub that
+    // only console.logs, so anything routed through it silently does nothing.
+    {
+      const nextMode = useStore.getState().appearancePrefs.uiMode === 'trace' ? 'classic' : 'trace';
+      items.push({
+        id: 'command:toggle-ui-mode',
+        label: nextMode === 'trace'
+          ? t('palette.modeTrace', 'Mode: TRACE — live circuit sidebar')
+          : t('palette.modeClassic', 'Mode: Classic sidebar'),
+        category: t('palette.category.commands'),
+        action: () => {
+          useStore.getState().setAppearancePrefs({ uiMode: nextMode });
+          onClose();
+        },
       });
     }
 
@@ -96,7 +120,13 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
             const created = (window as any).__wmux_createSurface?.({ type: 'markdown' });
             const surfaceId = created?.surfaceId as string | undefined;
             if (surfaceId) {
-              useStore.getState().setMarkdownContent(surfaceId as SurfaceId, res.content);
+              // Derive the basename for the tab label (renderer has no `path`),
+              // and keep the full path so the surface is path-aware (issue #116).
+              // A file picked from a native dialog is exactly the case where the
+              // user may not know where it lives.
+              const filePath = String(res.filePath || '') || undefined;
+              const fileName = (filePath || '').replace(/\\/g, '/').split('/').pop() || undefined;
+              useStore.getState().setMarkdownContent(surfaceId as SurfaceId, res.content, { fileName, filePath, mtimeMs: res.mtimeMs });
             }
           } catch {
             // Dialog/read failures are surfaced via the returned { error }; ignore here.
@@ -104,6 +134,40 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
         })();
       },
     });
+
+    // Category: Layouts — saved pane arrangements
+    items.push({
+      id: 'command:save-current-layout',
+      label: t('palette.saveCurrentLayout', 'Save current layout as new preset'),
+      category: t('palette.category.layouts', 'Layouts'),
+      action: () => {
+        onClose();
+        const id = saveCurrentLayoutAsPreset(
+          t('settings.workspacePanel.newLayoutName', 'Layout {n}').replace('{n}', String(savedLayouts.length + 1)),
+        );
+        // null means no active workspace to capture — an edge case, but a
+        // silent no-op here would look identical to "worked" from the palette.
+        if (!id) {
+          (window as any).wmux?.notification?.fire({
+            surfaceId: '',
+            text: t('palette.saveCurrentLayoutFailed', 'No active workspace to save as a layout.'),
+            title: 'wmux',
+          });
+        }
+      },
+    });
+    for (const layout of savedLayouts) {
+      items.push({
+        id: `layout:${layout.id}`,
+        label: t('palette.newWorkspaceWithLayout', 'New Workspace: {name}').replace('{name}', layout.name),
+        category: t('palette.category.layouts', 'Layouts'),
+        action: () => {
+          const newId = createWorkspace({ splitTree: instantiateLayout(layout.splitTree) });
+          selectWorkspace(newId);
+          onClose();
+        },
+      });
+    }
 
     // Category: Workspaces — switch to each workspace by name
     for (const ws of workspaces) {
@@ -135,7 +199,10 @@ export default function CommandPalette({ onClose, onAction }: CommandPaletteProp
     }
 
     return items;
-  }, [shortcuts, workspaces, activeWorkspaceId, selectWorkspace, onAction, onClose, t]);
+  }, [
+    shortcuts, workspaces, activeWorkspaceId, selectWorkspace, onAction, onClose, t,
+    savedLayouts, createWorkspace, saveCurrentLayoutAsPreset,
+  ]);
 
   // Filter based on query
   const filteredItems = useMemo(() => {

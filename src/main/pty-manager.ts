@@ -5,25 +5,194 @@ import { execFileSync, spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { SurfaceId } from '../shared/types';
 import { getPipePath, readPipeToken } from '../shared/instance';
+import { isPosixPath, expandPathVars } from '../shared/paths';
+import { PtyLedger } from './pty-ledger';
+import { attachErrorSink, installPtyCrashGuard } from './pty-crash-guard';
+import { powerShellShimDir } from './powershell-shim';
+import { getCliBinPath } from './cli-paths';
+import { getNodeRuntime } from './node-runtime';
+import { system32, opensshPath } from './system32';
+
+// Applied once, at load, before any PTY can exist — the exit callback it guards
+// is registered by node-pty inside pty.spawn(), so a later install would leave
+// every already-spawned pane on the unguarded path (issue #150).
+//
+// The result is kept rather than discarded so it can be RECORDED. "Installed at
+// module load" was a design claim nobody could check against a process that had
+// already died, which is exactly the question #150 got stuck on.
+const ptyCrashGuardInstalled = installPtyCrashGuard();
+
+/** Whether the #150 crash guard actually attached in this process. */
+export function isPtyCrashGuardInstalled(): boolean {
+  return ptyCrashGuardInstalled;
+}
 
 // ─── Shell resolution ──────────────────────────────────────────────────────
-// Validates that a shell executable exists before spawning.
-// Falls back through: pwsh.exe → powershell.exe → cmd.exe
+// Validates that a shell executable exists as a real file before spawning.
+// node-pty's Windows SearchPath concatenates PATH + the bare name and then
+// GetFileAttributes — App Execution Aliases (0-byte WindowsApps reparse
+// points) fail that check, so spawn('pwsh-preview') throws "File not found: "
+// with an empty path. `where` finds those aliases; fs.existsSync does not.
+// Fall back through: requested shell → pwsh.exe → powershell.exe → cmd.exe
 
 let cachedDefaultShell: string | null = null;
 
-function isShellAvailable(shell: string): boolean {
-  if (!shell) return false;
-  if (path.isAbsolute(shell)) {
-    return fs.existsSync(shell);
-  }
+/** First `where`/`which` hit that is a real file (skips WindowsApps aliases). */
+function firstExistingOnPath(name: string): string | undefined {
   try {
     const cmd = process.platform === 'win32' ? 'where' : 'which';
-    execFileSync(cmd, [shell], { windowsHide: true, timeout: 3000, stdio: 'ignore' });
-    return true;
+    // stderr is discarded rather than inherited: `where` prints a localised
+    // "could not find files for the given pattern" on every miss, and a miss is
+    // the normal case here (we probe pwsh before falling back). Inheriting it
+    // put OS-language noise in the user's terminal and in main.log.
+    const hits = execFileSync(cmd, [name], {
+      windowsHide: true,
+      timeout: 3000,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return hits.find((p) => fs.existsSync(p));
   } catch {
-    return false;
+    return undefined;
   }
+}
+
+/**
+ * Newest-first ordering of WindowsApps package directory names.
+ *
+ * Exported for tests: the failure it prevents only appears once a version
+ * number carries a two-digit component, so nothing on disk today would catch a
+ * regression back to a plain `.sort().reverse()`.
+ */
+export function comparePackageVersion(a: string, b: string): number {
+  const parts = (d: string) => (d.split('_')[1] ?? '').split('.').map((n) => Number(n) || 0);
+  const [pa, pb] = [parts(a), parts(b)];
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pb[i] ?? 0) - (pa[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+/**
+ * Store-installed PowerShell: WindowsApps\<pkg>\pwsh.exe.
+ *
+ * Both the stable and the preview package are reachable only through an App
+ * Execution Alias on PATH, which is exactly what node-pty cannot spawn — so a
+ * Store-only install of *either* needs the real exe underneath. The prefixes
+ * are disjoint because stable carries the underscore: `Microsoft.PowerShell_`
+ * does not match `Microsoft.PowerShellPreview_`.
+ */
+function findStorePwsh(preview: boolean): string | undefined {
+  const root = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'WindowsApps');
+  const prefix = preview ? 'Microsoft.PowerShellPreview_' : 'Microsoft.PowerShell_';
+  try {
+    const dirs = fs.readdirSync(root)
+      .filter((d) => d.startsWith(prefix))
+      .sort(comparePackageVersion);
+    for (const d of dirs) {
+      const exe = path.join(root, d, 'pwsh.exe');
+      if (fs.existsSync(exe)) return exe;
+    }
+  } catch {
+    // ACL-denied listing is fine — caller falls back.
+  }
+  return undefined;
+}
+
+/**
+ * The `where`/`which` probe, behind an object so a test can count invocations
+ * without spawning real processes — same reason `shellEnv` below exists.
+ */
+export const shellProbe = {
+  onPath: (name: string): string | undefined => firstExistingOnPath(name),
+};
+
+/**
+ * Resolutions already paid for, keyed by the spec as given (issue #176).
+ *
+ * `resolveExistingShellPath` runs on **every pane create**, and on a miss it
+ * runs twice — once here and once inside `resolveShell`'s fallback. Each miss
+ * or hit costs an `execFileSync('where', …)`, measured at ~51ms on a normal
+ * PATH, which is roughly double what `pty.spawn` itself costs. Restoring a
+ * session with 26 workspaces therefore burned 1.3–2.7 seconds re-asking the
+ * operating system the same question 26 times — synchronously, on the main
+ * process event loop, so nothing else ran either: not the other pane creates,
+ * and not the pipe server that receives the `report_shell_state` messages the
+ * sidebar's dots are waiting for.
+ *
+ * The precedent is three functions below: `shellEnv.hasWsl` is already cached
+ * "because it shells out to `where`, and this runs on every pane create". That
+ * reasoning was always true of the user's own shell too; only wsl.exe got the
+ * cache.
+ *
+ * Negative results are cached as well, deliberately. A miss is the *expensive*
+ * branch (two probes, and `where` scans the whole PATH before failing), and it
+ * is what a user with an uninstalled or mistyped shell hits on every pane. The
+ * cost is that installing a shell mid-session will not be noticed until wmux
+ * restarts — which is exactly how `cachedDefaultShell` and `cachedWsl` already
+ * behave, so this adds no new surprise.
+ *
+ * A cached *hit* is re-validated with a cheap `existsSync` before being handed
+ * back, so an exe that is uninstalled or moved while wmux runs re-probes
+ * instead of feeding a dead path to `pty.spawn` — which would surface as node-
+ * pty's opaque "File not found: ".
+ */
+const shellPathCache = new Map<string, string | undefined>();
+
+/** Drop every memoized resolution. For tests, and for a shell-config reload. */
+export function resetShellPathCache(): void {
+  shellPathCache.clear();
+}
+
+/** Absolute path of a real file node-pty can spawn, or undefined. Memoized. */
+export function resolveExistingShellPath(shell: string): string | undefined {
+  if (!shell) return undefined;
+
+  if (shellPathCache.has(shell)) {
+    const cached = shellPathCache.get(shell);
+    // A negative is returned as-is; a positive only if it is still on disk.
+    if (cached === undefined || fs.existsSync(cached)) return cached;
+    shellPathCache.delete(shell);
+  }
+
+  const resolved = resolveExistingShellPathUncached(shell);
+  shellPathCache.set(shell, resolved);
+  return resolved;
+}
+
+function resolveExistingShellPathUncached(shell: string): string | undefined {
+  if (path.isAbsolute(shell) && fs.existsSync(shell)) return shell;
+
+  const win32 = process.platform === 'win32';
+  const base = win32 ? path.basename(shell).toLowerCase().replace(/\.exe$/, '') : '';
+
+  // Before PATH, and only for a bare name — an absolute path the user wrote
+  // already won above. `wmux ssh user@host` and a workspace shell set to
+  // `ssh …` must get Windows' own ssh, not whichever build happens to be
+  // first on PATH; see opensshPath for why the two are not interchangeable.
+  //
+  // Only shell SPECS reach here. A command the user types at a prompt is
+  // resolved by the shell inside the PTY, so panes keep behaving like every
+  // other terminal.
+  if (base === 'ssh') {
+    const native = opensshPath('ssh');
+    if (fs.existsSync(native)) return native;
+  }
+
+  const onPath = shellProbe.onPath(shell);
+  if (onPath) return onPath;
+
+  // Bare alias with no real PATH hit. A Store-only PowerShell — stable or
+  // preview — is reachable only as an App Execution Alias, so `where` finds it
+  // and existsSync refuses it. Without this the stable case silently fell all
+  // the way back to Windows PowerShell 5.1.
+  if (base === 'pwsh-preview') return findStorePwsh(true);
+  if (base === 'pwsh') return findStorePwsh(false);
+  return undefined;
 }
 
 function getDefaultShell(): string {
@@ -32,24 +201,40 @@ function getDefaultShell(): string {
     ? ['pwsh.exe', 'powershell.exe', 'cmd.exe']
     : [process.env.SHELL || '/bin/sh'];
   for (const cmd of candidates) {
-    if (isShellAvailable(cmd)) {
-      cachedDefaultShell = cmd;
-      return cmd;
+    const resolved = resolveExistingShellPath(cmd);
+    if (resolved) {
+      cachedDefaultShell = resolved;
+      return resolved;
     }
   }
-  // cmd.exe is always available on Windows
   cachedDefaultShell = process.platform === 'win32' ? 'cmd.exe' : '/bin/sh';
   return cachedDefaultShell;
 }
 
-function resolveShell(shell: string | undefined): string {
-  if (shell && isShellAvailable(shell)) {
-    return shell;
-  }
+export function resolveShell(shell: string | undefined): string {
   if (shell) {
+    const resolved = resolveExistingShellPath(shell);
+    if (resolved) return resolved;
     console.warn(`[wmux] Shell not found: "${shell}", falling back to ${getDefaultShell()}`);
   }
   return getDefaultShell();
+}
+
+// A shell spec may be a bare executable ("pwsh.exe", an absolute path that can
+// contain spaces) or a command line with arguments ("ssh user@host",
+// '"C:\Tools\my shell.exe" --flag') — issue #78 remote terminals ride on the
+// latter. An existing absolute path is always treated as a bare executable so
+// legacy specs like "C:\Program Files\PowerShell\7\pwsh.exe" never get split.
+export function parseShellSpec(spec: string | undefined): { command: string; args: string[] } {
+  const trimmed = (spec || '').trim();
+  if (!trimmed) return { command: '', args: [] };
+  if (path.isAbsolute(trimmed) && fs.existsSync(trimmed)) {
+    return { command: trimmed, args: [] };
+  }
+  if (!/\s/.test(trimmed)) return { command: trimmed, args: [] };
+  const tokens = (trimmed.match(/"[^"]*"|\S+/g) ?? []).map((t) => t.replace(/^"|"$/g, ''));
+  const [command = '', ...args] = tokens;
+  return { command, args };
 }
 
 function getShellIntegrationPath(): string {
@@ -78,20 +263,103 @@ function getCliPath(): string {
   return path.join(__dirname, '../cli/wmux.js');
 }
 
+
 function getShellType(shell: string): 'powershell' | 'cmd' | 'wsl' | 'unknown' {
-  const lower = shell.toLowerCase();
+  // The basename, not the whole path. resolveShell used to hand back the bare
+  // name it was given; since #172 it returns the resolved absolute path, so any
+  // directory on the way to the exe would otherwise vote — and real ones do:
+  // C:\tools\cmder\bin\bash.exe would classify as cmd, and get cmd's shell
+  // integration injected into a bash session.
+  const lower = path.basename(shell).toLowerCase();
   if (lower.includes('pwsh') || lower.includes('powershell')) return 'powershell';
   if (lower.includes('cmd')) return 'cmd';
   if (lower.includes('wsl')) return 'wsl';
   return 'unknown';
 }
 
-// A POSIX/WSL path (e.g. /home/user/project restored from session.json — issue
-// #60). Such a path is NOT a valid working dir for a Win32 process and makes
-// pty.spawn fail with error 267 (ERROR_DIRECTORY). Win32 paths are drive-rooted
-// (C:\...) or UNC (\\server\...); a leading forward slash means POSIX.
-function isPosixPath(p: string): boolean {
-  return p.startsWith('/') && !p.startsWith('//');
+// The two environment facts resolveShellForCwd depends on, behind an object so
+// a test can substitute them without pretending to be Windows. `hasWsl` is
+// cached because it shells out to `where`, and this runs on every pane create.
+let cachedWsl: boolean | null = null;
+export const shellEnv = {
+  isWindows: (): boolean => process.platform === 'win32',
+  hasWsl: (): boolean => {
+    if (cachedWsl === null) cachedWsl = shellProbe.onPath('wsl.exe') !== undefined;
+    return cachedWsl;
+  },
+};
+
+// A pane whose cwd is a POSIX/WSL path (the common case once a WSL or
+// devcontainer shell has reported its directory via report_pwd) cannot be
+// served by a Win32 shell: resolveSpawnCwd() below has no choice but to hand
+// pwsh/cmd %USERPROFILE%, so a new tab or split silently lands in the Windows
+// home folder instead of the project. Translating to \\wsl.localhost\... is not
+// an option either — CreateProcess rejects a UNC working directory.
+//
+// wsl.exe is the one shell that CAN open that path (buildShellArgs passes it as
+// --cd), so substitute it. Only the two shells that are physically incapable of
+// the directory are replaced: an 'unknown' spec is left alone because it may be
+// a deliberate remote command line such as `ssh user@host` (issue #78).
+export function resolveShellForCwd(shell: string, cwd: string | undefined): string {
+  if (!shellEnv.isWindows()) return shell;
+  if (!cwd || !isPosixPath(cwd)) return shell;
+  const shellType = getShellType(shell);
+  if (shellType !== 'powershell' && shellType !== 'cmd') return shell;
+  if (!shellEnv.hasWsl()) return shell;
+  console.warn(`[wmux] cwd is a POSIX path, using wsl.exe instead of ${shell}: ${cwd}`);
+  return 'wsl.exe';
+}
+
+// Resolve the working dir handed to pty.spawn, guaranteeing it is a directory
+// that exists — otherwise CreateProcess fails with error 267 (ERROR_DIRECTORY)
+// and the pane dies with an opaque "Cannot create process, error code: 267".
+//
+// NEVER returns undefined. That used to be the answer when nothing named a
+// directory, and it meant node-pty's default: inherit wmux.exe's OWN working
+// directory. #205 already recorded what that is in practice — for a taskbar or
+// Start-menu launch, `C:\Windows\system32` — and treated it as the status quo
+// worth preserving. #214 is what preserving it cost. After a crash the OS
+// relaunches wmux with cwd `C:\Windows\system32`, every restored pane with no
+// remembered directory of its own starts there, and Claude Code files its
+// session transcript under `system32` — so `claude --continue` from the project
+// folder answers "no saved sessions" and the history looks lost when it is only
+// misfiled. The user's report calls this the one that hurts most, and it is not
+// really a fallback at all: it hands the pane wherever wmux happened to be
+// started from, which no user has ever chosen or can predict.
+//
+// %USERPROFILE% instead — the same fallback every other branch below already
+// uses for a cwd it cannot honour. Nothing that names a directory is affected:
+// a split inherits its parent's, "Open in wmux" and `--cwd` pass one outright,
+// a restored session carries the one it was frozen at, and `defaultCwd` (#205)
+// still wins over all of this. Only the case where the answer was previously
+// "wherever wmux.exe was launched from" changes.
+//
+// This is also the single place a HUMAN-typed path lands (the default starting
+// path setting, issue #205), so `~` and `%VAR%` are expanded here rather than in
+// the settings UI: every other entry point — session.json, `--cwd`, an
+// inherited split — passes through here too, and gets the same courtesy for
+// free. Expansion happens only for the SPAWN dir; resolveShellForCwd and
+// buildShellArgs above still see the raw string, which is what keeps `~` on a
+// wsl.exe pane meaning "the distro's home" (`--cd ~`) instead of a Win32 path
+// that distro cannot open.
+export function resolveSpawnCwd(raw: string | undefined): string {
+  const cwd = expandPathVars(raw ?? '', process.env);
+  const fallback = process.env.USERPROFILE || 'C:\\';
+  if (!cwd) return fallback;
+
+  // POSIX/WSL cwd: not a valid Win32 working dir at all (issue #60).
+  if (isPosixPath(cwd)) return fallback;
+
+  // Win32 cwd that no longer exists (deleted git worktree) or does not exist
+  // yet (spawn ordered before `git worktree add` finished). Also rejects a path
+  // that exists but is a FILE — CreateProcess wants a directory.
+  try {
+    if (fs.statSync(cwd).isDirectory()) return cwd;
+    console.warn(`[wmux] cwd is not a directory, falling back to ${fallback}: ${cwd}`);
+  } catch {
+    console.warn(`[wmux] cwd does not exist, falling back to ${fallback}: ${cwd}`);
+  }
+  return fallback;
 }
 
 // Build the launch args for a shell and mutate `env` with shell-specific vars.
@@ -121,12 +389,20 @@ function buildShellArgs(
     // strips every Windows env var, so the notification framework, sidebar and
     // `wmux` CLI inside WSL can't reach the host. /u = pass through, /up = pass
     // through AND translate the Windows path to a WSL mount (/mnt/c/...).
+    // WMUX_REMOTE / WMUX_REMOTE_TOKEN ride along so a devcontainer launched from
+    // this WSL shell inherits them and its CLI can reach wmux over the bridge
+    // (issue #19). Harmless when unset — WSLENV skips a variable with no value.
     const wmuxWslEnv =
-      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u';
+      'WMUX/u:WMUX_SURFACE_ID/u:WMUX_CLI/up:WMUX_PIPE/u:WMUX_PIPE_TOKEN/u:WMUX_INTEGRATION/u'
+      + ':WMUX_REMOTE/u:WMUX_REMOTE_TOKEN/u';
     env.WSLENV = env.WSLENV ? `${env.WSLENV}:${wmuxWslEnv}` : wmuxWslEnv;
     // A restored WSL/POSIX cwd (issue #60) can't be a Win32 process cwd (error
     // 267). Open it INSIDE the distro via --cd instead; the Win32-side cwd is
     // sanitized to a valid Windows dir by the caller.
+    //
+    // --cd is BEST-EFFORT: WSL applies it before the interactive login shell
+    // reads its rc, so a distro whose /etc/profile or ~/.profile cds to $HOME
+    // discards it and the pane opens at home. See docs/config.md.
     const posixCwd = cwd && isPosixPath(cwd) ? cwd : null;
     return ['--cd', posixCwd ?? '~'];
   }
@@ -192,6 +468,16 @@ const DA1_REPLY = '\x1b[?62;4;9;22c';
 export class PtyManager {
   private ptys = new Map<SurfaceId, PtyEntry>();
 
+  /**
+   * Optional on-disk record of every PID spawned here, so the next launch can
+   * tree-kill whatever this process left running if it dies without reaching
+   * `killAll()` (issue #139). Optional rather than constructed internally
+   * because tests spawn real PTYs: without an explicit ledger they must not
+   * touch — let alone overwrite — the ledger of the wmux instance the user has
+   * running on the same machine.
+   */
+  constructor(private readonly ledger: PtyLedger | null = null) {}
+
   // ConPTY's input pipe silently drops bytes when a single write outruns the
   // foreground process. Splitting at ~1 KB keeps every chunk well under the
   // pipe buffer; setImmediate between chunks lets ConPTY drain without adding
@@ -220,7 +506,22 @@ export class PtyManager {
       }
     }
 
-    const shell = resolveShell(options.shell);
+    // Split "ssh user@host"-style specs into executable + args (issue #78).
+    // Extra args only apply when the REQUESTED executable resolved — if we fell
+    // back to the default shell, its command line must not inherit ssh's args.
+    const spec = parseShellSpec(options.shell);
+    // A POSIX cwd forces wsl.exe — pwsh/cmd cannot open that directory at all
+    // and would silently start in %USERPROFILE% instead of the project.
+    //
+    // On a miss this resolves `spec.command` twice — here, and again inside
+    // resolveShell's fallback. That used to be two `where` invocations per pane
+    // on the slowest path; resolveExistingShellPath memoizes since #176, so the
+    // second is a Map lookup. Left as-is because the duplication is what keeps
+    // `requested` (did the REQUESTED shell resolve?) separable from `shell`
+    // (what we will actually spawn), which is what shellExtraArgs depends on.
+    const requested = resolveExistingShellPath(spec.command);
+    const shell = resolveShellForCwd(requested ?? resolveShell(spec.command), options.cwd);
+    const shellExtraArgs = requested ? spec.args : [];
     const shellType = getShellType(shell);
     const integrationDir = getShellIntegrationPath();
     const cliPath = getCliPath();
@@ -228,6 +529,13 @@ export class PtyManager {
     const processEnvClean = Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)
     );
+    // WMUX_CLI is a .js path, so anything that wants to RUN it needs a JS
+    // runtime too — and the host process is not reliably one (issue #187:
+    // OpenCode's `process.execPath` is the compiled `opencode.exe`, and node
+    // can be installed yet absent from the PATH a given agent inherited).
+    // wmux resolves it once, in the process best placed to look, and declares
+    // the answer alongside the script it applies to.
+    const nodeRuntime = getNodeRuntime();
     const env: { [key: string]: string } = {
       ...processEnvClean,
       ...options.env,
@@ -236,9 +544,34 @@ export class PtyManager {
       WMUX_PIPE: getPipePath(),
       WMUX_PIPE_TOKEN: readPipeToken(),
       WMUX_CLI: cliPath,
+      WMUX_NODE: nodeRuntime.path,
     };
+    // Only set when true. A consumer that spawns WMUX_NODE without honouring
+    // this opens a second wmux window instead of running a script, so the
+    // variable's presence — not its value — is the signal, and an absent one
+    // must never read as "yes".
+    if (nodeRuntime.electron) env.WMUX_NODE_ELECTRON = '1';
 
-    const args = buildShellArgs(shellType, env, integrationDir, options.cwd);
+    // Make bare `wmux` resolvable in every spawned shell AND all its children
+    // (Claude Code's Bash tool, hook scripts, the orchestrator coordinator) by
+    // prepending the cli-bin shim dir to PATH. PATH inherits down the process
+    // tree regardless of shell/login/interactive state — which is exactly what
+    // the interactive `wmux` shell function cannot reach. Prepend (not append)
+    // so this instance's shim wins; it is instance-scoped via $WMUX_CLI/$WMUX_PIPE
+    // anyway. The Windows env key is `Path`, so match case-insensitively.
+    // The .ps1 shim dir goes AHEAD of cli-bin when — and only when — wmux has
+    // verified PowerShell will run it (issue #154). PowerShell prefers a .ps1
+    // over every PATHEXT entry, so this is what takes cmd.exe's argument parser
+    // out of the PowerShell path; unverified, it is left off entirely rather
+    // than risk a `wmux` that errors instead of merely mis-quoting. Order does
+    // not matter to any other shell: bash and cmd.exe ignore .ps1 files.
+    const cliBinDir = getCliBinPath();
+    const shimDirs = [powerShellShimDir(), cliBinDir].filter((d): d is string => d !== null);
+    const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH';
+    const prefix = shimDirs.join(path.delimiter);
+    env[pathKey] = env[pathKey] ? `${prefix}${path.delimiter}${env[pathKey]}` : prefix;
+
+    const args = [...buildShellArgs(shellType, env, integrationDir, options.cwd), ...shellExtraArgs];
 
     // Quick-launch startup commands (issue #32). Run them as part of the shell's
     // own initialization — BEFORE the first interactive prompt — instead of
@@ -264,11 +597,18 @@ export class PtyManager {
       startupCommandsConsumed = true;
     }
 
-    // A POSIX/WSL cwd (restored from session.json — issue #60) is never a valid
-    // Win32 process working dir and triggers spawn error 267. Fall back to a real
-    // Windows dir; WSL itself is still sent to the POSIX path via --cd (above).
-    const spawnCwd =
-      options.cwd && isPosixPath(options.cwd) ? (process.env.USERPROFILE || 'C:\\') : options.cwd;
+    // CreateProcess fails with error 267 (ERROR_DIRECTORY) when the working dir
+    // isn't a real directory, and node-pty surfaces that as an opaque "Cannot
+    // create process, error code: 267" — the pane just dies. Two ways to get
+    // there, both fixed by falling back to a directory that exists:
+    //
+    //  - a POSIX/WSL cwd restored from session.json (issue #60) is never a valid
+    //    Win32 working dir. WSL itself still reaches the POSIX path via --cd above.
+    //  - a Win32 cwd that has since been deleted, or has not been created yet:
+    //    an agent spawned into a git worktree that was removed after its wave, or
+    //    ordered before `git worktree add` finished. The cwd comes from session
+    //    state / CLI args, so it must not be trusted to still exist at spawn time.
+    const spawnCwd = resolveSpawnCwd(options.cwd);
 
     const spawnOptions: pty.IWindowsPtyForkOptions = {
       name: 'xterm-256color',
@@ -290,6 +630,15 @@ export class PtyManager {
       console.warn('[wmux] spawn with bundled conpty.dll failed, retrying with inbox ConPTY:', err);
       ptyProcess = pty.spawn(shell, args, { ...spawnOptions, useConptyDll: false });
     }
+
+    // node-pty re-throws unrecognised socket errors out of a libuv callback
+    // unless the terminal already carries error listeners, and it registers
+    // none of its own — so an error on this pane's pipe crashes the main
+    // process and every other pane with it (issue #150). Claim the error here
+    // and let the pane die alone.
+    attachErrorSink(ptyProcess as unknown as Parameters<typeof attachErrorSink>[0], (err) => {
+      console.warn(`[wmux] pty ${id} socket error (contained):`, err);
+    });
 
     const entry: PtyEntry = {
       pty: ptyProcess,
@@ -318,11 +667,18 @@ export class PtyManager {
 
     ptyProcess.onExit(({ exitCode }) => {
       entry.alive = false; // stops any in-flight chunked write
+      if (typeof ptyProcess.pid === 'number') this.ledger?.remove(ptyProcess.pid);
       for (const listener of entry.exitListeners) {
         listener(exitCode);
       }
       this.ptys.delete(id);
     });
+
+    // Recorded after the listeners are attached but before returning, so a
+    // crash between here and the first user keystroke still leaves a trail.
+    if (typeof ptyProcess.pid === 'number' && ptyProcess.pid > 0) {
+      this.ledger?.add(ptyProcess.pid, path.basename(shell));
+    }
 
     this.ptys.set(id, entry);
     return { id, shell, startupCommandsConsumed, reused: false };
@@ -378,13 +734,23 @@ export class PtyManager {
 
   resize(id: SurfaceId, cols: number, rows: number): void {
     const entry = this.ptys.get(id);
-    if (!entry) return;
+    // `alive`, not just presence: the exit handler clears the flag before the
+    // entry leaves the map, and node-pty throws "Cannot resize a pty that has
+    // already exited" for anything in that window. A pane reflowing while its
+    // shell exits hits it, and this runs in the main process, where an
+    // unhandled throw is a crash rather than a warning. write() has guarded
+    // this way for a while; resize() was the one PTY entry point that didn't.
+    if (!entry || !entry.alive) return;
     // Drop no-op resizes: a same-size resize still makes the shell redraw its
     // prompt (doubled-prompt cause). Only forward genuine size changes.
     if (cols === entry.cols && rows === entry.rows) return;
     entry.cols = cols;
     entry.rows = rows;
-    entry.pty.resize(cols, rows);
+    try {
+      entry.pty.resize(cols, rows);
+    } catch {
+      // Exited between the liveness check and the call — nothing to resize.
+    }
   }
 
   kill(id: SurfaceId): void {
@@ -404,10 +770,9 @@ export class PtyManager {
     // and survives even when this runs from killAll() on app quit.
     if (process.platform === 'win32' && typeof pid === 'number' && pid > 0) {
       try {
-        // Resolve taskkill by absolute path from %SystemRoot%\System32 rather than
-        // relying on PATH — PATH could contain a writeable dir shadowing taskkill.
-        const systemRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
-        const taskkillPath = path.join(systemRoot, 'System32', 'taskkill.exe');
+        // Absolute path rather than PATH — a writeable dir on PATH could
+        // otherwise shadow taskkill.
+        const taskkillPath = system32('taskkill.exe');
         const killer = spawn(taskkillPath, ['/PID', String(pid), '/T', '/F'], {
           windowsHide: true,
           detached: true,
@@ -425,6 +790,7 @@ export class PtyManager {
     } catch {
       // Process may already be dead
     }
+    if (typeof pid === 'number') this.ledger?.remove(pid);
     this.ptys.delete(id);
   }
 
@@ -432,10 +798,25 @@ export class PtyManager {
     for (const id of this.ptys.keys()) {
       this.kill(id);
     }
+    // Belt and braces: kill() already dropped each PID, but killAll() is the
+    // shutdown path and the ledger must not outlive it under any partial failure.
+    this.ledger?.clear();
   }
 
   has(id: SurfaceId): boolean {
     return this.ptys.has(id);
+  }
+
+  /**
+   * How many PTYs this manager is holding.
+   *
+   * Recorded at teardown for #150: each live PTY is one node-pty
+   * ThreadSafeFunction whose exit callback will fire on the main thread, so
+   * "how many were outstanding when the session ended" is the number that says
+   * how wide the teardown race was.
+   */
+  count(): number {
+    return this.ptys.size;
   }
 
   onData(id: SurfaceId, callback: (data: string) => void): () => void {
@@ -459,5 +840,10 @@ export class PtyManager {
   getPid(id: SurfaceId): number | undefined {
     const entry = this.ptys.get(id);
     return entry?.pty.pid;
+  }
+
+  /** Every surface with a live PTY. Used by the ssh probe to map processes back to panes. */
+  liveSurfaceIds(): SurfaceId[] {
+    return Array.from(this.ptys.keys());
   }
 }

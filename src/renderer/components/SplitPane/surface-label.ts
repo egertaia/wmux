@@ -1,4 +1,8 @@
 import type { SurfaceRef } from '../../../shared/types';
+import type { TranslationKey } from '../../i18n/core';
+
+/** Defaults to returning the fallback verbatim so callers (and existing tests) that omit `t` still see English. */
+const identityT = (_key: TranslationKey, fallback?: string): string => fallback ?? _key;
 
 export function getShellLabel(shell?: string): string | null {
   if (!shell) return null;
@@ -13,20 +17,67 @@ export function getShellLabel(shell?: string): string | null {
   return normalized.replace(/\.exe$/i, '').replace(/[-_]/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-export function getSurfaceLabel(surface: SurfaceRef, agentLabel?: string, workspaceShell?: string): string {
+/** Extract the last path segment from a cwd string for use as a tab label. */
+function cwdFolderName(cwd: string): string | null {
+  const normalized = cwd.replace(/\\/g, '/').replace(/\/$/, '');
+  const lastSegment = normalized.split('/').pop();
+  return lastSegment || null;
+}
+
+/**
+ * @param oscTitle The OSC 0/2 window title the pane's program last set (issue
+ *   #221), already normalised by `normalizeOscTitle`, or undefined when the
+ *   feature is off or nothing has set one. Ranked BELOW both names a human
+ *   chose — an explicit `rename-surface` and an `agent spawn --label` — and
+ *   above the cwd: it only fills the gap where the tab had no name of its own
+ *   but the program in it has been announcing one all along.
+ */
+export function getSurfaceLabel(
+  surface: SurfaceRef,
+  agentLabel?: string,
+  workspaceShell?: string,
+  t: (key: TranslationKey, fallback?: string) => string = identityT,
+  oscTitle?: string,
+): string {
   if (surface.customTitle) return surface.customTitle;
   if (agentLabel) return agentLabel;
 
   switch (surface.type) {
-    case 'terminal':
-      return getShellLabel(surface.shell || workspaceShell) || 'Terminal';
+    case 'terminal': {
+      // Only inside the terminal case, not above the switch: a browser or
+      // markdown tab has no program that could have set a title, so one
+      // arriving for it means something is confused, and the static label is
+      // the answer that cannot be wrong.
+      if (oscTitle) return oscTitle;
+      const folder = surface.currentCwd ? cwdFolderName(surface.currentCwd) : null;
+      if (folder) return folder;
+      // resolvedShell first: it is the concrete executable, so it labels a
+      // pane started with no spec at all. `shell` may be a whole command line
+      // (`ssh user@host`), which getShellLabel would render as a mouthful.
+      return getShellLabel(surface.resolvedShell || surface.shell || workspaceShell)
+        || t('surfaceLabel.terminal', 'Terminal');
+    }
     case 'browser':
-      return 'Browser';
-    case 'markdown':
-      return 'Markdown';
+      return t('surfaceLabel.browser', 'Browser');
+    case 'markdown': {
+      // `•` for an unsaved buffer (issue #116, F3) — the same convention every
+      // editor uses, and the only signal on a tab the user isn't looking at.
+      const name = surface.markdownFileName || t('surfaceLabel.markdown', 'Markdown');
+      return surface.markdownDirty ? `• ${name}` : name;
+    }
     case 'diff':
-      return 'Diff';
+      return t('surfaceLabel.diff', 'Diff');
+    case 'code': {
+      // Same `•` as markdown, and the same flag behind it. A code surface used
+      // to be read-only by construction and carried no marker; now that it can
+      // be edited, an unsaved buffer on a tab the user is not looking at needs
+      // to say so — which is the entire job of this convention.
+      const name = surface.codeFileName || t('surfaceLabel.code', 'Code');
+      return surface.markdownDirty ? `• ${name}` : name;
+    }
+    case 'prompts':
+      return t('surfaceLabel.prompts', 'Prompts');
     default:
-      return 'Tab';
+      return t('surfaceLabel.tab', 'Tab');
   }
 }

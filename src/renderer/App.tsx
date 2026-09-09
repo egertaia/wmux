@@ -1,20 +1,43 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { v4 as uuid } from 'uuid';
+import { useShallow } from 'zustand/react/shallow';
 import { useStore } from './store';
-import { PaneId, SurfaceId, WorkspaceId, WorkspaceInfo, SplitNode } from '../shared/types';
+import { PaneId, SurfaceId, SurfaceRef, WorkspaceId, WorkspaceInfo, SplitNode } from '../shared/types';
+import { cwdReportPatch } from '../shared/paths';
 import SplitContainer from './components/SplitPane/SplitContainer';
-import { updateRatio, getAllPaneIds, findLeaf } from './store/split-utils';
+import { updateRatio, getAllPaneIds, findLeaf, replaceSoleTerminalSurface, freezeSurfaceCwds, dropEphemeralSurfaces, dropCodeContent } from './store/split-utils';
+import { DEFAULT_DEV_PORTS, mergeDevPorts, matchDevPorts, firstNewDevPort } from './dev-ports';
+import { aggregateProgress } from './store/progress-slice';
+import { isDiffTabDismissed } from './store/surface-slice';
 import Sidebar from './components/Sidebar/Sidebar';
+import { applyPrCommand } from './pr-metadata';
 import Titlebar from './components/Titlebar/Titlebar';
-import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useKeyboardShortcuts, matchesBinding } from './hooks/useKeyboardShortcuts';
 import SettingsWindow from './components/Settings/SettingsWindow';
 import CommandPalette from './components/CommandPalette/CommandPalette';
+import AgentNavigator from './components/AgentNavigator/AgentNavigator';
+import HubView from './components/Hub/hub-view';
+import { focusAgentTarget } from './store/focus-agent';
+import { useAgentDetection } from './hooks/useAgentDetection';
+import { useBlockedAlert } from './hooks/useBlockedAlert';
+import type { AgentRosterEntry } from './store/agent-rollup';
 import ShortcutCheatSheet from './components/CheatSheet/ShortcutCheatSheet';
+import ConfirmCloseDialog from './components/ConfirmCloseDialog';
+import ConfirmCloseSurfaceDialog from './components/ConfirmCloseSurfaceDialog';
 import BrowserPane from './components/Browser/BrowserPane';
+import { ExplorerPanel } from './components/Explorer/ExplorerPanel';
 import Tutorial from './components/Tutorial/Tutorial';
 import SplitPreviewOverlay from './components/SplitPane/SplitPreviewOverlay';
 import { initPipeBridge } from './pipe-bridge';
+import {
+  TERMINAL_MIN_WIDTH, PANEL_HANDLE_WIDTH, EXPLORER_MIN_WIDTH, BROWSER_MIN_WIDTH,
+  panelReservedWidth, clampPanelWidth,
+} from './panel-layout';
+import { setKeyRemaps } from './key-remaps';
 import { useUiTheme } from './hooks/useUiTheme';
+import { useUiMode } from './hooks/useUiMode';
+import { useWindowTransparency } from './hooks/useWindowTransparency';
+import { usePaneFill } from './hooks/usePaneFill';
+import { customBgLayerAlpha, hasCustomBackground } from './store/backdrop';
 import type {
   SurfaceDragCommitOptions,
   SurfaceDragPayload,
@@ -22,6 +45,12 @@ import type {
   SurfaceDragPreviewTarget,
 } from './components/SplitPane/drag-preview-types';
 import { buildSurfaceDragPreview } from './components/SplitPane/surface-drag-preview';
+import { forgetSurfaceTitle, surfaceTerminalRegistry } from './hooks/useTerminal';
+import { forgetSurface as forgetPromptLog, recordAgentPrompt } from './utils/prompt-log';
+import { SURFACE_CLOSED_EVENT } from './store/pty-teardown';
+import { followOutputFor, togglePinnedPromptFor, togglePromptOutlineFor } from './store/prompt-actions';
+import { useT } from './i18n';
+import type { TranslationKey } from './i18n';
 
 const DEFAULT_SIDEBAR_WIDTH = 240;
 
@@ -69,14 +98,105 @@ function findBottomPane(node: SplitNode): PaneId | null {
 // adds the in-app bell entry and raises the OS toast (via the renderer → main
 // NOTIFICATION_FIRE chokepoint).
 
-const DEV_PORTS = [3000, 3001, 4000, 4200, 5000, 5173, 5174, 8000, 8080, 8888];
+// Effective runtime values — seeded from the built-in defaults, then widened/
+// toggled by ~/.wmux/config.toml at startup and on `wmux reload-config`.
+let activeDevPorts: number[] = DEFAULT_DEV_PORTS;
+
+/**
+ * Apply `~/.wmux/config.toml`'s `[browser]` section: dev-port detection + auto-open.
+ * Resets to the built-in defaults first so `wmux reload-config` is idempotent —
+ * deleting a key (or the whole section) from the file reverts its effect instead
+ * of leaving the previous run's values sticky until restart.
+ */
+function applyUserConfigBrowser(state: any, browser: any): void {
+  activeDevPorts = DEFAULT_DEV_PORTS;
+  if (!browser) return;
+  if (Array.isArray(browser.devPorts) && browser.devPorts.length) {
+    activeDevPorts = mergeDevPorts(DEFAULT_DEV_PORTS, browser.devPorts);
+  }
+  // Like defaultUrl below, auto-open is a persisted PREF (Settings offers it too),
+  // so file-wins-at-startup and app-wins-at-runtime both fall out of writing it
+  // to the same place rather than to a module-level runtime value.
+  if (typeof browser.autoOpen === 'boolean') state.setBrowserPrefs({ autoOpenDevServer: browser.autoOpen });
+  // The start page (#212) is a persisted PREF, not a module-level runtime value
+  // like the two above, because Settings offers it too — so file-wins-at-startup
+  // and app-wins-at-runtime both fall out of writing it to the same place.
+  if (typeof browser.defaultUrl === 'string') state.setBrowserPrefs({ defaultUrl: browser.defaultUrl });
+}
+
+/**
+ * Apply `[workspace]` (issue #212): how many panes a new workspace opens with
+ * and how they sit. Same file-wins-at-startup contract as the sections above —
+ * written into the pref every entry point already reads, so the sidebar `+`,
+ * Ctrl+N, first launch and `wmux new-workspace` cannot diverge again.
+ */
+function applyUserConfigWorkspace(state: any, workspace: any): void {
+  if (!workspace) return;
+  const patch: any = {};
+  if (typeof workspace.panes === 'number') patch.newWorkspacePanes = workspace.panes;
+  if (typeof workspace.layout === 'string') patch.newWorkspaceLayout = workspace.layout;
+  if (Object.keys(patch).length) state.setWorkspacePrefs(patch);
+}
 
 type StoreAction = (...args: any[]) => void;
+type T = (key: TranslationKey, fallback?: string) => string;
 type MetaDeps = {
   updateWorkspaceMetadata: StoreAction;
   addNotification: StoreAction;
   runningStartTimes: React.MutableRefObject<Record<string, number>>;
+  t: T;
 };
+
+type SetWidth = (width: number) => void;
+
+/**
+ * Rehydrate from the rolling auto-save (the file main writes every 30s + on quit).
+ *
+ * `'fresh'` is main saying "this window was opened during the run — come up
+ * empty". It is distinct from `'none'` ("nothing saved for you") precisely
+ * because the caller must NOT fall through to a named session in that case:
+ * doing so cloned the session's workspace, pane and surface ids into a second
+ * window, and PTY id is surface id, so the clone re-attached to live PTYs and
+ * every id-based CLI lookup had two equally valid answers (issue #143).
+ */
+async function restoreAutoSaved(t: T, setWidth: SetWidth): Promise<'restored' | 'fresh' | 'none'> {
+  try {
+    const autoSaved = await window.wmux?.session?.loadAuto?.();
+    if (autoSaved && Array.isArray(autoSaved.workspaces) && autoSaved.workspaces.length > 0) {
+      useStore.getState().replaceAllWorkspaces(autoSaved.workspaces, autoSaved.activeIndex, t);
+      if (autoSaved.sidebarWidth) setWidth(autoSaved.sidebarWidth);
+      return 'restored';
+    }
+    return (autoSaved as { fresh?: boolean } | null | undefined)?.fresh ? 'fresh' : 'none';
+  } catch {
+    return 'none';
+  }
+}
+
+/**
+ * Fall back to the most recent manually-saved session. Returns whether it
+ * restored one.
+ *
+ * This is also the post-update path (the version change clears the auto-session
+ * and leaves an "Auto-backup vX" named session behind), so it has to restore
+ * exactly what the Sessions menu's Load does — including terminalPrefs, which
+ * it used to skip (issue #145).
+ */
+async function restoreNamedSession(t: T, setWidth: SetWidth): Promise<boolean> {
+  try {
+    const sessions = await window.wmux?.session?.list();
+    const name = sessions?.[0]?.name;
+    if (!name) return false;
+    const session = await window.wmux?.session?.load(name);
+    if (!session) return false;
+    useStore.getState().replaceAllWorkspaces(session.workspaces, undefined, t);
+    if (session.sidebarWidth) setWidth(session.sidebarWidth);
+    if (session.terminalPrefs) useStore.getState().setTerminalPrefs(session.terminalPrefs);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function fireNotification(
   surfaceId: string,
@@ -96,17 +216,68 @@ function workspaceForSurface(surfaceId: string): WorkspaceInfo | undefined {
   return useStore.getState().workspaces.find(ws => getAllSurfaces(ws.splitTree).includes(surfaceId));
 }
 
+type HookActivityMap = Record<string, { lastTool: string; toolCount: number; lastSeen: number }>;
+
+/**
+ * Stop hook = the turn is over. Zero out lastSeen so the sidebar flips to
+ * "Idle" immediately instead of waiting out the ACTIVITY_TTL window, and
+ * upsert the entry so turns with zero tool uses (pure text generation) still
+ * register as "Claude ran here and finished" — otherwise WorkspaceRow falls
+ * back to the shell's perpetual "Running" while the TUI sits idle (issue #81).
+ *
+ * Keyed by SURFACE, not workspace: two Claude sessions split inside one
+ * workspace must not zero each other's freshness. Only surfaceId-less legacy
+ * events fall back to the active workspace's id as key.
+ */
+function markSessionIdleOnStop(
+  surfaceId: string,
+  setHookActivity: React.Dispatch<React.SetStateAction<HookActivityMap>>,
+): void {
+  const key = surfaceId || useStore.getState().activeWorkspaceId;
+  if (!key) return;
+  setHookActivity(prev => {
+    const existing = prev[key] || { lastTool: '', toolCount: 0, lastSeen: 0 };
+    return { ...prev, [key]: { ...existing, lastSeen: 0 } };
+  });
+}
+
+/**
+ * Auto-open a diff tab in the workspace's BOTTOM pane when Claude edits/writes
+ * files. Opt-out via Settings → Workspace (issue #66): users who find the tab
+ * popping up and stealing focus disruptive can turn it off entirely.
+ */
+function maybeAutoOpenDiffTab(tool: string, ownerWs: WorkspaceInfo): void {
+  const state = useStore.getState();
+  if ((tool !== 'Edit' && tool !== 'Write') || !state.workspacePrefs.autoOpenDiffTab) return;
+  // A diff tab the user closed stays closed (issue #141). Without this, every
+  // Edit/Write put it back minutes later with no user action — and on a large
+  // repo its polling is what made typing lag, so "close it" was not a fix.
+  if (isDiffTabDismissed(ownerWs.id)) return;
+  const bottomPaneId = findBottomPane(ownerWs.splitTree);
+  if (!bottomPaneId) return;
+  const bottomLeaf = findLeafFromTree(ownerWs.splitTree, bottomPaneId);
+  // Only add diff tab if bottom pane doesn't already have one
+  if (bottomLeaf && !bottomLeaf.surfaces.some(s => s.type === 'diff')) {
+    state.addSurface(ownerWs.id, bottomPaneId, 'diff', { auto: true });
+  }
+}
+
 function handlePortsUpdate(cmd: any, updateWorkspaceMetadata: StoreAction): void {
   try {
     const portsByPid = JSON.parse(cmd.args?.[0] || '{}');
     const allPorts = Object.values(portsByPid).flat() as number[];
-    const devPorts = allPorts.filter((p: number) => DEV_PORTS.includes(p));
+    const devPorts = matchDevPorts(allPorts, activeDevPorts);
     if (devPorts.length > 0) {
       const currentWs = useStore.getState().activeWorkspaceId;
       const ws = useStore.getState().workspaces.find(w => w.id === currentWs);
-      // Only auto-navigate the browser to a NEW dev port.
-      if (currentWs && !(ws?.ports || []).includes(devPorts[0])) {
-        window.wmux?.browser?.navigate?.(`browser-${currentWs}`, `http://localhost:${devPorts[0]}`);
+      // Auto-navigate to a newly-appeared dev port — one this workspace hasn't seen
+      // yet — rather than blindly devPorts[0]. Otherwise a freshly-started server
+      // never opens when other recognized ports are already listening (netstat order
+      // is arbitrary), and the guard permanently suppresses navigation thereafter.
+      const newPort = firstNewDevPort(devPorts, ws?.ports || []);
+      const autoOpenDevPort = useStore.getState().browserPrefs.autoOpenDevServer;
+      if (autoOpenDevPort && currentWs && newPort !== undefined) {
+        window.wmux?.browser?.navigate?.(`browser-${currentWs}`, `http://localhost:${newPort}`);
       }
     }
     for (const ws of useStore.getState().workspaces) {
@@ -116,8 +287,8 @@ function handlePortsUpdate(cmd: any, updateWorkspaceMetadata: StoreAction): void
 }
 
 /** `wmux notify <text>` — works even outside a pane (falls back to active workspace). */
-function handleNotifyCommand(cmd: any, addNotification: StoreAction): void {
-  const text = (cmd.args || []).join(' ').trim() || 'Notification';
+function handleNotifyCommand(cmd: any, addNotification: StoreAction, t: T): void {
+  const text = (cmd.args || []).join(' ').trim() || t('app.notificationDefault', 'Notification');
   const ws = workspaceForSurface(cmd.surfaceId);
   const wsId = ws?.id || useStore.getState().activeWorkspaceId;
   fireNotification(cmd.surfaceId, wsId, text, addNotification);
@@ -140,47 +311,106 @@ function applyShellState(cmd: any, ws: WorkspaceInfo, deps: MetaDeps): void {
   delete deps.runningStartTimes.current[ws.id];
   if (elapsed < 5) return;
 
-  const duration = elapsed >= 60
-    ? `${Math.floor(elapsed / 60)}m${Math.round(elapsed % 60)}s`
-    : `${Math.round(elapsed)}s`;
+  // Round to whole seconds BEFORE splitting into minutes — rounding the
+  // remainder independently yields "3m60s" for 239.6s elapsed.
+  const totalSeconds = Math.round(elapsed);
+  const duration = totalSeconds >= 60
+    ? `${Math.floor(totalSeconds / 60)}m${totalSeconds % 60}s`
+    : `${totalSeconds}s`;
   const msg = newState === 'interrupted'
-    ? `Interrupted in ${ws.title} (${duration})`
-    : `Finished in ${ws.title} (${duration})`;
+    ? deps.t('app.interruptedIn', 'Interrupted in {workspace} ({duration})').replace('{workspace}', ws.title).replace('{duration}', duration)
+    : deps.t('app.finishedIn', 'Finished in {workspace} ({duration})').replace('{workspace}', ws.title).replace('{duration}', duration);
   fireNotification(cmd.surfaceId, ws.id, msg, deps.addNotification);
+}
+
+/** Apply a patch to one surface of `ws`, wherever in the split tree it lives. */
+function patchSurface(ws: WorkspaceInfo, surfaceId: SurfaceId, patch: Partial<Omit<SurfaceRef, 'id' | 'type' | 'shell'>>): void {
+  const { updateSurface } = useStore.getState();
+  for (const paneId of getAllPaneIds(ws.splitTree)) {
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (leaf?.surfaces.some((s) => s.id === surfaceId)) {
+      updateSurface(ws.id, paneId, surfaceId, patch);
+      return;
+    }
+  }
 }
 
 /** Dispatch a surface-scoped metadata command to the owning workspace. */
 function handleSurfaceMetadata(cmd: any, ws: WorkspaceInfo, deps: MetaDeps): void {
   switch (cmd.command) {
-    case 'report_pwd':
-      deps.updateWorkspaceMetadata(ws.id, { cwd: cmd.args?.[0] });
+    case 'report_pwd': {
+      const pwd = cmd.args?.[0];
+      // Records the POSIX path separately so a pwsh report cannot erase the
+      // WSL fallback its neighbours depend on — without this, the next WSL
+      // pane in the workspace gets `--cd ~`.
+      deps.updateWorkspaceMetadata(ws.id, cwdReportPatch(pwd));
+      // Also store cwd at the surface level so the tab label can show the project folder.
+      if (pwd && cmd.surfaceId) patchSurface(ws, cmd.surfaceId, { currentCwd: pwd });
       break;
+    }
+    case 'report_startup_command': {
+      // A shell declares how to bring its own surface back after a restart —
+      // a devcontainer shell reports the launcher that re-enters the container,
+      // so a restored pane starts in WSL and runs it (issue #19). Reported per
+      // surface, stored per surface: two containers in one pane restore to two
+      // different containers. No argument clears it.
+      //
+      // The command must be cwd-independent (`cd '<path>' && …`): the restored
+      // pane's shell is a fresh login shell whose rc files have had their say,
+      // so nothing guarantees it starts where the reporting shell was.
+      if (!cmd.surfaceId) break;
+      const command = cmd.args?.[0];
+      patchSurface(ws, cmd.surfaceId, { startupCommands: command ? [command] : undefined });
+      break;
+    }
     case 'report_git_branch':
       deps.updateWorkspaceMetadata(ws.id, { gitBranch: cmd.args?.[0], gitDirty: cmd.args?.[1] === 'dirty' });
       break;
     case 'clear_git_branch':
       deps.updateWorkspaceMetadata(ws.id, { gitBranch: undefined, gitDirty: undefined });
       break;
-    case 'report_pr': {
-      const [num, status, ...labelParts] = cmd.args || [];
-      deps.updateWorkspaceMetadata(ws.id, {
-        prNumber: num ? parseInt(num) : undefined,
-        prStatus: status as any,
-        prLabel: labelParts.join(' '),
-      });
+    case 'report_pr':
+    case 'clear_pr': {
+      // See pr-metadata.ts: `clear_pr` is gated on the surface that reported
+      // the PR still being the one asking to clear it, so one pane's poller
+      // can't wipe another pane's PR out of a shared workspace row.
+      const patch = applyPrCommand(cmd, ws);
+      if (patch) deps.updateWorkspaceMetadata(ws.id, patch);
       break;
     }
-    case 'clear_pr':
-      deps.updateWorkspaceMetadata(ws.id, { prNumber: undefined, prStatus: undefined, prLabel: undefined });
-      break;
     case 'report_shell_state':
       applyShellState(cmd, ws, deps);
       break;
   }
 }
 
+/**
+ * Claude Code UserPromptSubmit → the pane's prompt log (issue #207).
+ *
+ * Needs the surface's live terminal, because a prompt boundary is only useful
+ * as a POSITION in a buffer: the marker has to be registered against the
+ * emulator, now, while the cursor is still where the submission left it.
+ *
+ * Silently does nothing without one. A hook can arrive for a surface this
+ * window does not own — `handleHookEvent` broadcasts to every window, since a
+ * surface may live in a second one (issue #143) — and for a pane whose terminal
+ * is mid-remount. Neither is an error; the window that owns the surface handles
+ * it, and a prompt lost to a remount is one line in an outline.
+ */
+function recordPromptSubmission(event: any): void {
+  const surfaceId = typeof event.surfaceId === 'string' ? event.surfaceId : '';
+  const prompt = typeof event.prompt === 'string' ? event.prompt : '';
+  if (!surfaceId || !prompt) return;
+  const terminal = surfaceTerminalRegistry.get(surfaceId);
+  if (!terminal) return;
+  // `at` is stamped at hook PROCESS START, not on arrival — hook processes race
+  // each other, and the outline is ordered by this.
+  const at = typeof event.at === 'number' ? event.at : Date.now();
+  recordAgentPrompt(terminal, surfaceId, prompt, at);
+}
+
 /** Claude Code Notification (needs input) / Stop (turn finished) hook events. */
-function handleAgentLifecycleEvent(event: any, addNotification: StoreAction): void {
+function handleAgentLifecycleEvent(event: any, addNotification: StoreAction, t: T): void {
   const state = useStore.getState();
   const prefs = state.notificationPrefs;
   if (event.event === 'Notification' && prefs.agentInputNotify === false) return;
@@ -193,55 +423,61 @@ function handleAgentLifecycleEvent(event: any, addNotification: StoreAction): vo
 
   let text: string;
   if (event.event === 'Notification') {
-    text = event.message || 'Claude Code needs your input';
+    text = event.message || t('app.claudeNeedsInput', 'Claude Code needs your input');
   } else {
-    text = wsTitle ? `Claude Code finished in ${wsTitle}` : 'Claude Code finished';
+    text = wsTitle
+      ? t('app.claudeFinishedIn', 'Claude Code finished in {workspace}').replace('{workspace}', wsTitle)
+      : t('app.claudeFinished', 'Claude Code finished');
   }
   fireNotification(sid, wsId, text, addNotification);
 }
 
-/** Build the default 3-terminal split layout for new workspaces */
-function buildDefaultSplitTree(): SplitNode {
-  return {
-    type: 'branch',
-    direction: 'vertical',
-    ratio: 0.5,
-    children: [
-      {
-        type: 'branch',
-        direction: 'horizontal',
-        ratio: 0.5,
-        children: [
-          {
-            type: 'leaf',
-            paneId: `pane-${uuid()}` as PaneId,
-            surfaces: [{ id: `surf-${uuid()}` as SurfaceId, type: 'terminal' }],
-            activeSurfaceIndex: 0,
-          },
-          {
-            type: 'leaf',
-            paneId: `pane-${uuid()}` as PaneId,
-            surfaces: [{ id: `surf-${uuid()}` as SurfaceId, type: 'terminal' }],
-            activeSurfaceIndex: 0,
-          },
-        ],
-      },
-      {
-        type: 'leaf',
-        paneId: `pane-${uuid()}` as PaneId,
-        surfaces: [{ id: `surf-${uuid()}` as SurfaceId, type: 'terminal' }],
-        activeSurfaceIndex: 0,
-      },
-    ],
-  };
+/**
+ * --replace-tab agent spawn (PR #85): swap the pane's sole idle default
+ * terminal for the agent surface instead of appending, so orchestration panes
+ * don't keep an unused shell tab. Guards: exactly one surface, terminal type
+ * (enforced in replaceSoleTerminalSurface), and not itself an agent surface.
+ * Returns true when the spawn was handled via replacement.
+ */
+export function tryReplaceTabSpawn(event: any, ws: WorkspaceInfo, setAgentMeta: (surfaceId: any, meta: any) => void): boolean {
+  if (!event.replaceTab) return false;
+  const state = useStore.getState();
+  const leaf = findLeaf(ws.splitTree, event.paneId);
+  const sole = leaf?.surfaces.length === 1 ? leaf.surfaces[0] : undefined;
+  if (!sole || state.agentMeta.get(sole.id)) return false;
+  const { tree, replacedSurfaceId } = replaceSoleTerminalSurface(
+    ws.splitTree, event.paneId, { id: event.surfaceId, type: 'terminal' },
+  );
+  if (!replacedSurfaceId) return false;
+  state.updateSplitTree(event.workspaceId, tree);
+  setAgentMeta(event.surfaceId, { agentId: event.agentId, label: event.label, status: 'running' });
+  // Intentionally not pushed onto the reopen-closed stack — the replaced
+  // surface is an idle default shell, not user work.
+  window.wmux?.pty?.kill(replacedSurfaceId);
+  // This kills the PTY directly instead of routing through closeSurface, so
+  // it must run the same ownership-gated PR-badge clear closeSurface would
+  // have run — otherwise a replaced tab that happened to hold the PR badge
+  // leaves `prSurfaceId` pointing at a surface that no longer exists, and
+  // since clear_pr is only honoured from its owner (see pr-metadata.ts), the
+  // badge becomes unclearable by anything, ever.
+  state.clearPrIfSurfaceOwner(event.workspaceId, [replacedSurfaceId]);
+  return true;
 }
 
 export default function App() {
+  // Field-scoped store subscription. A bare `useStore()` subscribes App to the
+  // WHOLE store, so every set() anywhere — one pane's OSC 9;4 progress, an
+  // agent verdict, a settings write — re-rendered App and with it the sidebar
+  // and every workspace's split container. That is #141's shape one level up:
+  // the per-chunk paths stay out of the store, but any store write that DID
+  // land still cost a full-App render. useShallow pins the subscription to the
+  // fields App actually reads; the actions are identity-stable, so App now
+  // re-renders only when workspaces/active/sidebar/shortcuts/notifications move.
   const {
     workspaces,
     activeWorkspaceId,
     createWorkspace,
-    closeWorkspace,
+    requestCloseWorkspace,
     selectWorkspace,
     renameWorkspace,
     reorderWorkspaces,
@@ -256,32 +492,122 @@ export default function App() {
     setAgentMeta,
     addNotification,
     toggleSidebar,
-  } = useStore();
+  } = useStore(useShallow((s) => ({
+    workspaces: s.workspaces,
+    activeWorkspaceId: s.activeWorkspaceId,
+    createWorkspace: s.createWorkspace,
+    requestCloseWorkspace: s.requestCloseWorkspace,
+    selectWorkspace: s.selectWorkspace,
+    renameWorkspace: s.renameWorkspace,
+    reorderWorkspaces: s.reorderWorkspaces,
+    updateWorkspaceMetadata: s.updateWorkspaceMetadata,
+    updateSplitTree: s.updateSplitTree,
+    sidebarVisible: s.sidebarVisible,
+    shortcuts: s.shortcuts,
+    notifications: s.notifications,
+    markRead: s.markRead,
+    markAllRead: s.markAllRead,
+    selectSurface: s.selectSurface,
+    setAgentMeta: s.setAgentMeta,
+    addNotification: s.addNotification,
+    toggleSidebar: s.toggleSidebar,
+  })));
 
   useUiTheme();
+  useUiMode();
+  useWindowTransparency();
+  usePaneFill();
+  const t = useT();
 
   const [focusedPaneId, setFocusedPaneId] = useState<PaneId | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [agentNavigatorOpen, setAgentNavigatorOpen] = useState(false);
+  const [hubOpen, setHubOpen] = useState(false);
+  const hubEnabled = useStore((s) => s.appearancePrefs.hubEnabled);
+  // Screen detection for agents that report no state of their own. One loop for
+  // the whole window; it skips every surface whose agent IS reporting.
+  useAgentDetection(useStore((s) => s.workspacePrefs.detectAgentScreens));
+  // Taskbar flash when an agent starts waiting on you. Gated on the EXISTING
+  // notification prefs rather than a new one — `taskbarFlash` had a Settings
+  // toggle and translations in 18 languages and nothing read it, so this is
+  // what that switch has been promising all along.
+  useBlockedAlert(useStore((s) => s.notificationPrefs.taskbarFlash && s.notificationPrefs.agentInputNotify));
   // Shortcut cheat-sheet overlay (issue #64, toggled by F1 via wmux:toggle-cheatsheet).
   const [cheatSheetOpen, setCheatSheetOpen] = useState(false);
+  // Closing the overlay must hand focus back to the terminal it was opened
+  // from. The sheet focuses its own filter box on mount, so without this the
+  // caret is left on <body> and the next keystroke goes nowhere — the user has
+  // to click the pane again. Only reachable now that F1 escapes a focused
+  // terminal at all; before that the overlay could only be opened from
+  // somewhere that was not a terminal.
+  const closeCheatSheet = useCallback(() => {
+    setCheatSheetOpen(false);
+    const st = useStore.getState();
+    const ws = st.workspaces.find((w) => w.id === st.activeWorkspaceId);
+    const leaf = ws && focusedPaneId ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+    const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+    if (surface?.type !== 'terminal') return;
+    // After the overlay unmounts, or the focus lands on an element about to go.
+    requestAnimationFrame(() => {
+      try { surfaceTerminalRegistry.get(surface.id)?.focus(); } catch { /* disposed */ }
+    });
+  }, [focusedPaneId]);
+  // F1 toggles, so it is also the most natural way to CLOSE the sheet — and
+  // that path has to restore focus exactly like the x, the backdrop and Esc do.
+  // A bare `setCheatSheetOpen(o => !o)` here silently skipped closeCheatSheet,
+  // which is why the caret was still stranded on <body> after F1-F1 even with
+  // the focus-return fix in place: every close route was covered except the one
+  // the keyboard user actually takes.
   useEffect(() => {
-    const toggle = () => setCheatSheetOpen((open) => !open);
+    const toggle = () => {
+      if (cheatSheetOpen) closeCheatSheet();
+      else setCheatSheetOpen(true);
+    };
     document.addEventListener('wmux:toggle-cheatsheet', toggle);
     return () => document.removeEventListener('wmux:toggle-cheatsheet', toggle);
-  }, []);
+  }, [cheatSheetOpen, closeCheatSheet]);
   // Broadcast-input mode banner (issue #64): mirror the runtime store flag.
   const broadcastInputActive = useStore((s) => s.broadcastInputActive);
+  // Custom background parallel to theming (issue #89): rendered as a layer
+  // behind the split tree. Panes with a custom background drop their own theme
+  // colour to fully transparent (see `terminalBgAlpha`), so this layer IS the
+  // terminal background rather than something glimpsed through it.
+  const appearancePrefs = useStore((s) => s.appearancePrefs);
+  const customBgActive = hasCustomBackground(appearancePrefs);
+  // Same guard as useTerminal: until the window is rebuilt there is nothing
+  // behind this layer to fade toward.
+  const transparencyPending = useStore((s) => s.transparencyNeedsRestart);
+  // With a transparent window the custom background is no longer the bottom
+  // layer — the desktop is. Ghostty composites its background image onto the
+  // background colour and applies `background-opacity` to the RESULT, so this
+  // layer takes the window opacity directly.
+  //
+  // Only when transparency is on: with an opaque window there is nothing behind
+  // this layer but --ui-bg-1, and fading toward the app's own chrome colour is
+  // not a look anyone asked for.
+  const customBgOpacity = customBgLayerAlpha(appearancePrefs, transparencyPending);
   // Browser panel auto-opens on startup unless disabled in Settings (issue #22).
   const [browserOpen, setBrowserOpen] = useState(() => useStore.getState().browserPrefs.openOnStartup);
+  // Subscribed rather than read once: the start page (#212) can change under a
+  // `wmux reload-config`, and a panel already mounted for a workspace that has
+  // been nowhere should pick it up.
+  const browserPrefs = useStore((s) => s.browserPrefs);
   const [browserWidth, setBrowserWidth] = useState(420);
   const [isResizingBrowser, setIsResizingBrowser] = useState(false);
+  const [explorerOpen, setExplorerOpen] = useState(false);
+  const [explorerWidth, setExplorerWidth] = useState(260);
+  const [isResizingExplorer, setIsResizingExplorer] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const [notifPanelOpen, setNotifPanelOpen] = useState(false);
   // Per-workspace hook activity: workspaceId → { lastTool, toolCount, lastSeen }
   const [hookActivity, setHookActivity] = useState<Record<string, { lastTool: string; toolCount: number; lastSeen: number }>>({});
   // Per-surface Claude activity (parsed from terminal output)
   const [claudeActivity, setClaudeActivity] = useState<Record<string, any>>({});
+  // surfaceId → declared agent state (blocked / working / idle), issue #128.
+  // Lives in the store, not in local state: consumers outside this subtree —
+  // the keyboard shortcuts, the agent navigator — need to read it too.
+  const agentStates = useStore(s => s.agentStates);
   // Track when each workspace entered "running" state (for notification threshold)
   const runningStartTimes = useRef<Record<string, number>>({});
   // Browser URL tracking is now per-workspace via WorkspaceInfo.browserUrl
@@ -289,12 +615,10 @@ export default function App() {
   // Global keyboard listener for command palette toggle (Ctrl+Shift+P)
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent): void {
-      const binding = shortcuts.commandPalette;
-      const matches =
-        e.key === binding.key &&
-        !!binding.ctrl === e.ctrlKey &&
-        !!binding.shift === e.shiftKey &&
-        !!binding.alt === e.altKey;
+      // matchesBinding lowercases single-letter keys before comparing — Shift
+      // uppercases e.key (Ctrl+Shift+P fires with e.key='P'), but bindings are
+      // stored lowercase. A naive e.key === binding.key here never matched.
+      const matches = matchesBinding(e, shortcuts.commandPalette);
 
       if (matches) {
         e.preventDefault();
@@ -311,7 +635,26 @@ export default function App() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   }, [shortcuts, commandPaletteOpen]);
+  // Viewport width as state, not a bare window.innerWidth read: the panel
+  // clamps below are render-time, and a resize (or a monitor change on a
+  // restored session) has to re-run them. Nothing else re-renders on resize.
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    // Read once on mount too: the first paint can precede the window settling
+    // into its restored bounds, and no resize event follows if it doesn't.
+    onResize();
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  // Session writes read the width through this ref, not the state value.
+  // As a dependency, `sidebarWidth` re-subscribed the auto-save listener and
+  // rebuilt the save callback on every intermediate value of a drag; the ref
+  // keeps those stable, so only the settled width matters (issue 07).
+  const sidebarWidthRef = useRef(sidebarWidth);
+  useEffect(() => { sidebarWidthRef.current = sidebarWidth; }, [sidebarWidth]);
 
   // Open tutorial on first launch, unless the welcome screen is disabled in
   // Settings (issue #22). The "seen" flag still prevents re-showing it.
@@ -334,33 +677,18 @@ export default function App() {
   // restart users with no manually-saved snapshot lost their workspaces.
   useEffect(() => {
     (async () => {
-      try {
-        const autoSaved = await window.wmux?.session?.loadAuto?.();
-        if (autoSaved && Array.isArray(autoSaved.workspaces) && autoSaved.workspaces.length > 0) {
-          const { replaceAllWorkspaces } = useStore.getState();
-          replaceAllWorkspaces(autoSaved.workspaces, autoSaved.activeIndex);
-          if (autoSaved.sidebarWidth) setSidebarWidth(autoSaved.sidebarWidth);
-          return;
-        }
-      } catch {}
-      try {
-        const sessions = await window.wmux?.session?.list();
-        if (sessions && sessions.length > 0) {
-          const session = await window.wmux?.session?.load(sessions[0].name);
-          if (session) {
-            const { replaceAllWorkspaces } = useStore.getState();
-            replaceAllWorkspaces(session.workspaces);
-            if (session.sidebarWidth) setSidebarWidth(session.sidebarWidth);
-            return;
-          }
-        }
-      } catch {}
-      // No saved session — create default workspace
+      const outcome = await restoreAutoSaved(t, setSidebarWidth);
+      if (outcome === 'restored') return;
+      // 'fresh' means main deliberately wants this window empty — a named
+      // session must not be cloned into it (issue #143).
+      if (outcome !== 'fresh' && await restoreNamedSession(t, setSidebarWidth)) return;
+      // Nothing to restore — create the default workspace. No splitTree here on
+      // purpose: createWorkspace resolves it, and since #212 that resolution is
+      // the SAME one every other entry point gets (the default layout if one is
+      // marked, else the configured pane count/arrangement). Passing a shape in
+      // is what let first launch, the sidebar `+` and the CLI disagree.
       if (useStore.getState().workspaces.length === 0) {
-        createWorkspace({
-          title: 'Session 1',
-          splitTree: buildDefaultSplitTree(),
-        });
+        createWorkspace({ title: t('app.firstSessionTitle', 'Session 1') });
       }
     })();
   }, []);
@@ -395,10 +723,21 @@ export default function App() {
     const apply = (result: any) => {
       const state = useStore.getState();
       applyUserConfigTerminal(state, result?.terminal);
+      applyUserConfigBrowser(state, result?.browser);
+      applyUserConfigWorkspace(state, result?.workspace);
+      // `[keys]` remaps (issue #146) — main has already parsed and validated
+      // them, so this is a straight hand-off to the terminal key handler.
+      setKeyRemaps(result?.keys);
 
       // App UI theme override (issue #67): `[appearance] ui-theme = "..."`.
       const uiTheme = result?.appearance?.uiTheme;
       if (uiTheme) state.setAppearancePrefs({ uiTheme });
+
+      // Community translations from ~/.wmux/locales (issue #147) ride the same
+      // reload so `wmux reload-config` refreshes everything under ~/.wmux, not
+      // just config.toml. Absent on the startup read — the registry already
+      // loaded them synchronously before the store existed.
+      if (result?.locales) state.reloadUserLocales(result.locales);
     };
 
     cfg.getUserConfig().then(apply).catch(() => { /* no-op */ });
@@ -406,15 +745,50 @@ export default function App() {
     return () => { try { unsub?.(); } catch { /* no-op */ } };
   }, []);
 
+  // First launch after an update that changed the app icon (issues #137/#226):
+  // the taskbar may keep drawing the old one until Explorer restarts, and the
+  // person who can trigger that needs to know the button exists. Asked once,
+  // here, rather than pushed from main — main decided at startup, before this
+  // page existed, and a push would have raced the listener.
+  useEffect(() => {
+    const take = window.wmux?.system?.takeIconChangeNotice;
+    if (!take) return;
+    let cancelled = false;
+    take().then((due: boolean) => {
+      if (!due || cancelled) return;
+      const st = useStore.getState();
+      const ws = st.workspaces.find((w) => w.id === st.activeWorkspaceId) ?? st.workspaces[0];
+      if (!ws) return;
+      addNotification({
+        surfaceId: '' as SurfaceId,
+        workspaceId: ws.id,
+        title: t('notification.iconChanged.title', 'wmux has a new icon'),
+        text: t('notification.iconChanged.text',
+          'If the taskbar or a pinned button still shows the old one, use Settings → General → Refresh taskbar icons.'),
+      });
+    }).catch(() => { /* no main, or an old preload */ });
+    return () => { cancelled = true; };
+  }, []);
+
   // Listen for agent spawn events from main process
   useEffect(() => {
     if (!window.wmux?.agent?.onUpdate) return;
     const unsub = window.wmux.agent.onUpdate((event: any) => {
+      if (event.type === 'exited') {
+        // Flip the sidebar agent line to done; no-op for unknown surfaces.
+        const existing = useStore.getState().agentMeta.get(event.surfaceId);
+        if (existing && existing.status !== 'exited') {
+          setAgentMeta(event.surfaceId, { ...existing, status: 'exited', exitCode: event.exitCode });
+        }
+        return;
+      }
       if (event.type === 'spawned') {
         const { surfaceId, paneId, workspaceId, label } = event;
         const state = useStore.getState();
         const ws = state.workspaces.find((w) => w.id === workspaceId);
         if (!ws) return;
+
+        if (tryReplaceTabSpawn(event, ws, setAgentMeta)) return;
 
         const addSurfaceToLeaf = (node: SplitNode): SplitNode => {
           if (node.type === 'leaf' && node.paneId === paneId) {
@@ -435,18 +809,58 @@ export default function App() {
   // Listen for real-time metadata updates from shell integration (pipe server → IPC → here)
   useEffect(() => {
     if (!window.wmux?.metadata?.onUpdate) return;
-    const deps: MetaDeps = { updateWorkspaceMetadata, addNotification, runningStartTimes };
+    const deps: MetaDeps = { updateWorkspaceMetadata, addNotification, runningStartTimes, t };
     const unsub = window.wmux.metadata.onUpdate((cmd: any) => {
       if (!cmd) return;
       // ports_update and notify have no (required) surfaceId — handle globally.
       if (cmd.command === 'ports_update') { handlePortsUpdate(cmd, updateWorkspaceMetadata); return; }
-      if (cmd.command === 'notify') { handleNotifyCommand(cmd, addNotification); return; }
+      if (cmd.command === 'notify') { handleNotifyCommand(cmd, addNotification, t); return; }
+      // set_workspace_status is keyed on workspaceId (not surfaceId) — a
+      // coordinator setting a named workspace's status via `wmux set-status
+      // --workspace`. Handle before the surfaceId guard below.
+      if (cmd.command === 'set_workspace_status') {
+        const [state, text] = cmd.args || [];
+        if (state === 'idle' || state === 'running' || state === 'interrupted') {
+          const target = useStore.getState().workspaces.find((w) => w.id === cmd.workspaceId);
+          if (target) {
+            updateWorkspaceMetadata(target.id, { shellState: state, notificationText: text || undefined });
+          }
+        }
+        return;
+      }
 
       if (!cmd.surfaceId) return;
       const ws = workspaceForSurface(cmd.surfaceId);
       if (ws) handleSurfaceMetadata(cmd, ws, deps);
     });
     return unsub;
+  }, []);
+
+  // Forget a closed surface's prompt log (issue #207) and window title (#221).
+  //
+  // Bound to the destructive-close chokepoint in pty-teardown.ts, not to React
+  // unmount: a split-tree restructure unmounts and remounts a pane that is still
+  // very much open, and dropping its prompts there would empty the outline
+  // whenever the user closed an ADJACENT pane.
+  //
+  // Without this the log outlived the pane for the life of the window: `wmux
+  // prompts` reported closed panes as live ones, and the user's prompt text
+  // stayed queryable by any other pane's agent long after they closed the tab it
+  // belonged to.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const surfaceId = (e as CustomEvent).detail?.surfaceId;
+      if (typeof surfaceId !== 'string' || !surfaceId) return;
+      forgetPromptLog(surfaceId);
+      useStore.getState().clearPromptsForSurface(surfaceId);
+      // Both halves, in this order: the module map AND its pending throttle
+      // timer first, or a flush already armed re-publishes the title into the
+      // store a moment after the store entry was dropped.
+      forgetSurfaceTitle(surfaceId);
+      useStore.getState().clearOscTitle(surfaceId);
+    };
+    document.addEventListener(SURFACE_CLOSED_EVENT, handler);
+    return () => document.removeEventListener(SURFACE_CLOSED_EVENT, handler);
   }, []);
 
   // Listen for Claude Code hook events — tie to active workspace
@@ -457,54 +871,62 @@ export default function App() {
       // Agent lifecycle (issue #53): Notification = agent needs input/permission,
       // Stop = agent finished its turn. These have no `tool`, so handle first.
       if (event?.event === 'Notification' || event?.event === 'Stop') {
-        handleAgentLifecycleEvent(event, addNotification);
+        handleAgentLifecycleEvent(event, addNotification, t);
+        if (event.event === 'Stop') markSessionIdleOnStop(event.surfaceId, setHookActivity);
+        return;
+      }
+      // The user's own prompt, straight from Claude Code's UserPromptSubmit
+      // hook (issue #207). This is the authoritative boundary source for an
+      // agent pane and the only one that knows the TEXT — an agent TUI repaints
+      // over its own input box, so nothing that reads the screen afterwards can
+      // recover it. Handled here, before the `tool` guard below, because it has
+      // no tool and would otherwise be dropped like every other body-carrying
+      // event.
+      if (event?.event === 'UserPromptSubmit') {
+        recordPromptSubmission(event);
         return;
       }
       if (!event?.tool) return;
       const state = useStore.getState();
-      // Resolve the workspace that OWNS the agent's pane (issue #63), so the
-      // diff tab and sidebar activity attach to the agent's workspace — not
-      // whichever workspace happens to be focused. Fall back to the active
-      // workspace only when the event carries no surfaceId (legacy hooks).
-      const ownerWs = workspaceForSurface(event.surfaceId)
-        ?? state.workspaces.find(w => w.id === state.activeWorkspaceId);
-      if (!ownerWs) return;
-      const wsId = ownerWs.id;
+      // Key hook activity by SURFACE when the event carries one — each Claude
+      // session (pane) tracks its own freshness, so two sessions in the same
+      // workspace can't clobber each other into a stuck "Running"/false "Idle".
+      // Legacy events without surfaceId fall back to the active workspace id.
+      const key = event.surfaceId || state.activeWorkspaceId;
+      if (!key) return;
 
-      // Track hook activity for sidebar display
+      // PreToolUse says the same tool is STARTING (issue #151). It refreshes the
+      // label and the freshness stamp — that is the whole point, a three-minute
+      // Bash used to show nothing until it ended — but it must not touch the
+      // counter: `toolCount` is TRACE mode's odometer of completed tool calls,
+      // and counting each tool at both ends would double every reading.
+      const starting = event.event === 'PreToolUse';
       setHookActivity(prev => {
-        const existing = prev[wsId] || { lastTool: '', toolCount: 0, lastSeen: 0 };
+        const existing = prev[key] || { lastTool: '', toolCount: 0, lastSeen: 0 };
         return {
           ...prev,
-          [wsId]: {
+          [key]: {
             lastTool: event.tool,
-            toolCount: existing.toolCount + 1,
+            toolCount: existing.toolCount + (starting ? 0 : 1),
             lastSeen: Date.now(),
           },
         };
       });
+      if (starting) return;
 
-      // Auto-open diff tab in the BOTTOM pane when Claude edits/writes files.
-      // Opt-out via Settings → Workspace (issue #66): users who find the tab
-      // popping up and stealing focus disruptive can turn it off entirely.
-      if ((event.tool === 'Edit' || event.tool === 'Write') && state.workspacePrefs.autoOpenDiffTab) {
-        const ws = ownerWs;
-        if (ws) {
-          const bottomPaneId = findBottomPane(ws.splitTree);
-          if (bottomPaneId) {
-            const bottomLeaf = findLeafFromTree(ws.splitTree, bottomPaneId);
-            // Only add diff tab if bottom pane doesn't already have one
-            if (bottomLeaf && !bottomLeaf.surfaces.some(s => s.type === 'diff')) {
-              state.addSurface(wsId, bottomPaneId, 'diff');
-            }
-          }
-        }
-      }
+      // Diff tab opens in the workspace that OWNS the pane (issue #63). A
+      // surfaceId that doesn't resolve here belongs to another window —
+      // opening a diff tab in whatever workspace is focused would misfire.
+      const ownerWs = event.surfaceId
+        ? workspaceForSurface(event.surfaceId)
+        : state.workspaces.find(w => w.id === state.activeWorkspaceId);
+      if (ownerWs) maybeAutoOpenDiffTab(event.tool, ownerWs);
     });
     return unsub;
   }, []);
 
   // NOTE: hookActivity entries are intentionally kept forever (not cleaned up).
+  // Keys are surface ids (per Claude session) or workspace ids (legacy events).
   // WorkspaceRow uses the lastSeen timestamp + TTL to decide what to display.
   // Keeping stale entries lets us distinguish "Claude was active but stopped"
   // (idle) from "a regular shell command is running" (no hookActivity at all).
@@ -519,6 +941,76 @@ export default function App() {
     return unsub;
   }, []);
 
+  // Declared agent state pushed by the agent itself (issue #128). Unlike the
+  // scraped/heuristic signals above this is authoritative, so it is kept in its
+  // own map and given precedence in claude-session-view.
+  //
+  // AGENT_STATE is a delta channel, so a window that opens while agents are
+  // already running would see nothing until each next reported — a new window
+  // showed an empty sidebar next to three busy panes. Seed once at mount, then
+  // apply deltas. The seed is fired first but applied through `replace`, so a
+  // delta that lands during the await is not silently overwritten by an older
+  // snapshot: the listener is attached before the request goes out, and any
+  // surface it touched is re-applied after.
+  useEffect(() => {
+    if (!window.wmux?.agentState?.onUpdate) return;
+    let seeded = false;
+    const pending: any[] = [];
+
+    const unsub = window.wmux.agentState.onUpdate((data: any) => {
+      if (!data?.surfaceId) return;
+      if (!seeded) pending.push(data);
+      useStore.getState().setAgentState(data);
+    });
+
+    void (async () => {
+      const states = await window.wmux?.agentState?.list?.();
+      if (Array.isArray(states)) useStore.getState().replaceAgentStates(states);
+      seeded = true;
+      for (const data of pending) useStore.getState().setAgentState(data);
+      pending.length = 0;
+    })();
+
+    return unsub;
+  }, []);
+
+  // Which agent runs in each surface (phase 2). Same delta-plus-seed shape as
+  // the state channel above, and needed for the same reason: a pane whose shell
+  // spec named an agent at create time never emits again, so a window opened
+  // afterwards would never learn about it.
+  useEffect(() => {
+    if (!window.wmux?.agentIdentity?.onUpdate) return;
+    const unsub = window.wmux.agentIdentity.onUpdate((data: any) => {
+      if (data?.surfaceId) useStore.getState().setAgentIdentity(data);
+    });
+    void (async () => {
+      const list = await window.wmux?.agentIdentity?.list?.();
+      if (Array.isArray(list) && list.length > 0) {
+        // Merge, never replace: a delta may already have landed for a surface
+        // the seed does not know about, and the seed is the older view.
+        for (const entry of list) useStore.getState().setAgentIdentity(entry);
+      }
+    })();
+    return unsub;
+  }, []);
+
+  // ── Windows taskbar progress (OSC 9;4) ──────────────────────────────────
+  // Fold every surface's progress into one value for this window's taskbar
+  // button — the same convention Windows Terminal follows for the sequence.
+  const surfaceProgress = useStore((s) => s.surfaceProgress);
+  useEffect(() => {
+    const api = window.wmux?.window;
+    if (!api?.setProgress) return;
+    const agg = aggregateProgress(Object.values(surfaceProgress));
+    if (!agg) {
+      api.setProgress(-1, 'none');
+      return;
+    }
+    const MODES: Record<number, string> = { 1: 'normal', 2: 'error', 3: 'indeterminate', 4: 'paused' };
+    const value = agg.state === 3 ? 1 : Math.min(1, Math.max(0, agg.value / 100));
+    api.setProgress(value, MODES[agg.state]);
+  }, [surfaceProgress]);
+
   // Respond to main process auto-save requests (30s timer + on quit)
   useEffect(() => {
     if (!window.wmux?.session?.onAutoSaveRequest) return;
@@ -528,7 +1020,7 @@ export default function App() {
         version: 1,
         windows: [{
           bounds: { x: 0, y: 0, width: 0, height: 0 }, // main process fills real bounds
-          sidebarWidth,
+          sidebarWidth: sidebarWidthRef.current,
           activeWorkspaceId: state.activeWorkspaceId,
           workspaces: state.workspaces.map(ws => ({
             id: ws.id,
@@ -537,22 +1029,80 @@ export default function App() {
             pinned: ws.pinned,
             shell: ws.shell,
             cwd: ws.cwd, // issue #20 — restore so new terminals reopen in the workspace folder
-            splitTree: ws.splitTree,
+            // The WSL half of that: ws.cwd is whichever pane reported last, so a
+            // pwsh pane leaves a Win32 path behind and every restored WSL pane
+            // falls through to `--cd ~`. Persist the POSIX one alongside it.
+            posixCwd: ws.posixCwd,
+            // Per-tab directories, frozen at save time (issue #134): ws.cwd above
+            // is a single value for the whole workspace, so on its own it sends
+            // every restored terminal to the same place.
+            splitTree: dropCodeContent(dropEphemeralSurfaces(freezeSurfaceCwds(ws.splitTree))),
             browserUrl: ws.browserUrl,
             browserWidth: ws.browserWidth,
+            explorerOpen: ws.explorerOpen,
+            explorerWidth: ws.explorerWidth,
+            explorerExpanded: ws.explorerExpanded,
+            explorerShowHidden: ws.explorerShowHidden,
           })),
         }],
       };
       window.wmux.session.pushAutoSave(data);
     });
     return unsub;
-  }, [sidebarWidth]);
+  }, []);
 
   // Auto-focus first pane whenever the active workspace changes or gains its first pane
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;
   // During drag use live browserWidth state; otherwise use the persisted value from the
   // workspace (falls back to browserWidth for workspaces that have never been resized).
-  const displayBrowserWidth = isResizingBrowser ? browserWidth : (activeWorkspace?.browserWidth ?? browserWidth);
+  //
+  // A persisted width is clamped AGAIN here, against the window as it is right
+  // now. The drag clamp only ever saw the monitor the drag happened on: a width
+  // chosen at 3840px comes back verbatim at 1366px, flexShrink:0, with a second
+  // unclamped panel next to it — and restore is the one path where the user did
+  // not choose the bad width. Same reservation arithmetic as the drag (see
+  // panel-layout.ts), so the two can never disagree.
+  const rawBrowserWidth = activeWorkspace?.browserWidth ?? browserWidth;
+  const rawExplorerWidth = activeWorkspace?.explorerWidth ?? explorerWidth;
+  const displayBrowserWidth = isResizingBrowser ? browserWidth : clampPanelWidth(rawBrowserWidth, {
+    reserved: panelReservedWidth({
+      sidebarWidth: sidebarVisible ? sidebarWidth : 0,
+      otherPanelOpen: explorerOpen,
+      otherPanelWidth: rawExplorerWidth,
+    }),
+    min: BROWSER_MIN_WIDTH,
+    viewportWidth,
+  });
+  const displayExplorerWidth = isResizingExplorer ? explorerWidth : clampPanelWidth(rawExplorerWidth, {
+    reserved: panelReservedWidth({
+      sidebarWidth: sidebarVisible ? sidebarWidth : 0,
+      otherPanelOpen: browserOpen,
+      otherPanelWidth: rawBrowserWidth,
+    }),
+    min: EXPLORER_MIN_WIDTH,
+    viewportWidth,
+  });
+
+  // Open/closed is per-workspace and persisted, so the toggle writes both.
+  // The store write is deliberately OUTSIDE the setState updater: an updater
+  // must be pure, and StrictMode double-invokes it — which made one toggle
+  // write the workspace twice.
+  const handleToggleExplorer = useCallback((next?: boolean) => {
+    const value = next ?? !explorerOpen;
+    setExplorerOpen(value);
+    if (activeWorkspaceId) {
+      updateWorkspaceMetadata(activeWorkspaceId, { explorerOpen: value });
+    }
+  }, [explorerOpen, activeWorkspaceId, updateWorkspaceMetadata]);
+
+  // Restore per-workspace on switch. Deps include explorerOpen itself, not just
+  // the id: session restore can set activeWorkspaceId before (or in a separate
+  // commit from) the workspace object landing in `workspaces`, so an id-only
+  // dep would sample `undefined` once and never re-fire since the id didn't
+  // change again.
+  useEffect(() => {
+    setExplorerOpen(!!activeWorkspace?.explorerOpen);
+  }, [activeWorkspaceId, activeWorkspace?.explorerOpen]);
 
   useEffect(() => {
     if (!activeWorkspace) return;
@@ -561,6 +1111,30 @@ export default function App() {
       setFocusedPaneId(paneIds[0]);
     }
   }, [activeWorkspace?.id, activeWorkspace?.splitTree]);
+
+  /**
+   * Tell every `prompts` PANE which terminal it is listing (issue #207 follow-up).
+   *
+   * A prompts pane is not attached to the terminal it describes — it lives
+   * somewhere else in the split tree — so the focused terminal has to be pushed
+   * to it. Computed here because this is where focus lives; `focusedPaneId` is
+   * component state, not store state.
+   *
+   * The `if` is the whole rule. Focus landing on ANYTHING that is not a terminal
+   * leaves the last value standing, so clicking into the prompts pane itself —
+   * to filter it, to scroll it, to click a row — does not blank the list the
+   * user just reached for. `setPromptSourceSurface` no-ops on an unchanged
+   * value, which matters because this runs on every split-tree edit.
+   */
+  useEffect(() => {
+    const leaf = activeWorkspace && focusedPaneId
+      ? findLeaf(activeWorkspace.splitTree, focusedPaneId)
+      : undefined;
+    const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+    if (surface?.type === 'terminal') {
+      useStore.getState().setPromptSourceSurface(surface.id);
+    }
+  }, [activeWorkspace?.splitTree, focusedPaneId]);
 
   const handleRatioChange = useCallback(
     (leftPaneId: PaneId, rightPaneId: PaneId, ratio: number) => {
@@ -582,11 +1156,11 @@ export default function App() {
   const handleCreateWorkspace = useCallback(() => {
     const wsCount = useStore.getState().workspaces.length;
     const newId = createWorkspace({
-      title: `Session ${wsCount + 1}`,
-      splitTree: buildDefaultSplitTree(),
+      title: t('app.sessionTitle', 'Session {n}').replace('{n}', String(wsCount + 1)),
+      // No splitTree: createWorkspace resolves the one shared answer (#212).
     });
     selectWorkspace(newId);
-  }, [createWorkspace, selectWorkspace]);
+  }, [createWorkspace, selectWorkspace, t]);
 
   const handleSaveSession = useCallback(async (name: string) => {
     const state = useStore.getState();
@@ -596,27 +1170,40 @@ export default function App() {
       workspaces: state.workspaces.map(ws => ({
         title: ws.title,
         customColor: ws.customColor,
+        // Pinning is part of the layout the user arranged — the auto-save has
+        // always kept it, so a named save must too (issue #145).
+        pinned: ws.pinned,
         shell: ws.shell,
         cwd: ws.cwd || '',
-        splitTree: ws.splitTree,
+        posixCwd: ws.posixCwd || '',
+        // See the auto-save path below — a named session is the case #134
+        // reported, where losing a worktree's drive makes the session
+        // unidentifiable after a restore.
+        splitTree: dropCodeContent(dropEphemeralSurfaces(freezeSurfaceCwds(ws.splitTree))),
         browserUrl: ws.browserUrl || '',
         browserWidth: ws.browserWidth,
+        explorerOpen: ws.explorerOpen,
+        explorerWidth: ws.explorerWidth,
+        explorerExpanded: ws.explorerExpanded,
+        explorerShowHidden: ws.explorerShowHidden,
       })),
-      sidebarWidth,
+      sidebarWidth: sidebarWidthRef.current,
       terminalPrefs: { ...state.terminalPrefs },
     };
     await window.wmux?.session?.save(session);
-    window.wmux?.notification?.fire({ surfaceId: '', text: `Session "${name}" saved`, title: 'wmux' });
-  }, [sidebarWidth]);
+    window.wmux?.notification?.fire({ surfaceId: '', text: t('app.sessionSaved', 'Session "{name}" saved').replace('{name}', name), title: 'wmux' });
+    // sidebarWidth is read through sidebarWidthRef (PR #131), so it is
+    // deliberately not a dependency — a drag must not rebuild this callback.
+  }, [t]);
 
   const handleLoadSession = useCallback(async (name: string) => {
     const session = await window.wmux?.session?.load(name);
     if (!session) return;
     const { replaceAllWorkspaces, setTerminalPrefs } = useStore.getState();
-    replaceAllWorkspaces(session.workspaces);
+    replaceAllWorkspaces(session.workspaces, undefined, t);
     if (session.sidebarWidth) setSidebarWidth(session.sidebarWidth);
     if (session.terminalPrefs) setTerminalPrefs(session.terminalPrefs);
-  }, []);
+  }, [t]);
 
   const handleUpdateMetadata = useCallback(
     (id: WorkspaceId, partial: Partial<WorkspaceInfo>) => {
@@ -629,10 +1216,43 @@ export default function App() {
     setCommandPaletteOpen(false);
   }, []);
 
+  // The palette's Actions category has always been a stub that logs and closes
+  // — every entry is listed, none of them run. Fixing that wholesale means
+  // hoisting useKeyboardShortcuts' handler table out of its effect, which is a
+  // bigger change than #175 justifies and would put 40 untested paths into a
+  // patch release.
+  //
+  // resetTerminal is wired anyway, because it is a *recovery* command: the
+  // pane it exists for is one where the mouse is dead and the keyboard may be
+  // going somewhere unexpected, and "open the palette and pick it" is the one
+  // route that still works when the shortcut itself is what the user cannot
+  // remember. Listing it and not running it would be worse than not listing it.
   const handlePaletteAction = useCallback((action: string) => {
-    console.log(`[wmux] Command palette action: ${action}`);
+    const ws = workspaces.find((w) => w.id === activeWorkspaceId);
+    const leaf = ws && focusedPaneId ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+    const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+    const terminalSurfaceId = surface?.type === 'terminal' ? surface.id : null;
+
+    if (action === 'resetTerminal') {
+      if (terminalSurfaceId) {
+        document.dispatchEvent(new CustomEvent('wmux:reset-terminal', { detail: { surfaceId: terminalSurfaceId } }));
+      }
+    } else if (action === 'togglePromptOutline') {
+      togglePromptOutlineFor(
+        terminalSurfaceId,
+        activeWorkspaceId && focusedPaneId ? { workspaceId: activeWorkspaceId, paneId: focusedPaneId } : null,
+      );
+    } else if (action === 'togglePinnedPrompt') {
+      togglePinnedPromptFor(terminalSurfaceId);
+    } else if (action === 'followOutput') {
+      followOutputFor(terminalSurfaceId);
+    } else if (action === 'toggleExplorer') {
+      handleToggleExplorer();
+    } else {
+      console.log(`[wmux] Command palette action: ${action}`);
+    }
     setCommandPaletteOpen(false);
-  }, []);
+  }, [workspaces, activeWorkspaceId, focusedPaneId, handleToggleExplorer]);
 
   const workspaceNames = React.useMemo(() => {
     const map = new Map<string, string>();
@@ -662,6 +1282,41 @@ export default function App() {
     },
     [selectWorkspace, markRead, selectSurface],
   );
+
+  /**
+   * Go to one agent — the roster banner, the navigator and the jumpToBlocked
+   * shortcut all land here, so "jump" means exactly one thing.
+   *
+   * Reads the workspaces off the store rather than the render closure: the
+   * shortcut fires from a document listener whose closure can be a tick stale,
+   * and a split that just happened would otherwise resolve against the old tree.
+   */
+  const focusAgent = useCallback((entry: AgentRosterEntry) => {
+    const state = useStore.getState();
+    const paneId = focusAgentTarget(
+      { workspaces: state.workspaces, selectWorkspace: state.selectWorkspace, selectSurface: state.selectSurface },
+      entry,
+    );
+    if (paneId) setFocusedPaneId(paneId);
+  }, []);
+
+  // The shortcut lives in useKeyboardShortcuts, which has no way to reach this
+  // component's state — same document-event relay as rename-surface and
+  // reset-terminal use.
+  useEffect(() => {
+    const open = () => setAgentNavigatorOpen(true);
+    document.addEventListener('wmux:open-agent-navigator', open);
+    return () => document.removeEventListener('wmux:open-agent-navigator', open);
+  }, []);
+
+  // Agent office hub. The CustomEvent relay serves the keyboard shortcut
+  // (useKeyboardShortcuts cannot reach this component's state); the titlebar
+  // button sets the state directly via its prop.
+  useEffect(() => {
+    const open = () => setHubOpen(true);
+    document.addEventListener('wmux:open-hub', open);
+    return () => document.removeEventListener('wmux:open-hub', open);
+  }, []);
 
   const handleToggleNotifPanel = useCallback(() => {
     setNotifPanelOpen((o) => !o);
@@ -783,7 +1438,7 @@ export default function App() {
     if (!paneIds.includes(zoomedPaneId)) setZoomedPaneId(null);
   }, [zoomedPaneId, activeWorkspace]);
 
-  useKeyboardShortcuts(focusedPaneId, setSettingsOpen, () => setBrowserOpen(o => !o), handleToggleNotifPanel, setFocusedPaneId, handleToggleZoom);
+  useKeyboardShortcuts(focusedPaneId, setSettingsOpen, () => setBrowserOpen(o => !o), handleToggleNotifPanel, setFocusedPaneId, handleToggleZoom, () => handleToggleExplorer());
 
   // Derive a title for the titlebar: active workspace title or blank
   const titlebarText = activeWorkspace?.title ?? '';
@@ -797,6 +1452,8 @@ export default function App() {
         onHelpClick={() => setTutorialOpen(true)}
         onDevToolsClick={() => window.wmux?.system?.toggleDevTools?.()}
         onSettingsClick={() => setSettingsOpen(true)}
+        onHubClick={() => setHubOpen(true)}
+        hubEnabled={hubEnabled}
         notifications={notifications}
         workspaceNames={workspaceNames}
         notificationPanelOpen={notifPanelOpen}
@@ -813,16 +1470,23 @@ export default function App() {
             sidebarWidth={sidebarWidth}
             onWidthChange={handleSidebarWidthChange}
             onSelect={selectWorkspace}
-            onClose={closeWorkspace}
+            onClose={requestCloseWorkspace}
             onCreate={handleCreateWorkspace}
             onRename={renameWorkspace}
             onReorder={reorderWorkspaces}
             onUpdateMetadata={handleUpdateMetadata}
             hookActivity={hookActivity}
             claudeActivity={claudeActivity}
+            agentStates={agentStates}
             onSaveSession={handleSaveSession}
             onLoadSession={handleLoadSession}
             onCollapse={toggleSidebar}
+            onFocusAgentPane={(wsId, paneId) => {
+              selectWorkspace(wsId);
+              setFocusedPaneId(paneId);
+            }}
+            onFocusAgent={focusAgent}
+            onOpenAgentNavigator={() => setAgentNavigatorOpen(true)}
           />
         ) : (
           <div
@@ -846,7 +1510,7 @@ export default function App() {
               document.addEventListener('mousemove', onMove);
               document.addEventListener('mouseup', onUp);
             }}
-            title="Expand sidebar (Ctrl+B)"
+            title={t('app.expandSidebar', 'Expand sidebar (Ctrl+B)')}
           >
             <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
               <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06z"/>
@@ -856,7 +1520,19 @@ export default function App() {
 
         {/* Middle: terminals — ALL workspaces stay mounted, only active is visible */}
         {/* This keeps PTYs alive when switching sessions (Claude Code etc. keep running) */}
-        <div style={{ flex: 1, overflow: 'hidden', position: 'relative', minWidth: 0 }}>
+        <div style={{ flex: 1, overflow: 'hidden', position: 'relative', minWidth: TERMINAL_MIN_WIDTH }}>
+          {customBgActive && (
+            <div
+              aria-hidden
+              style={{
+                position: 'absolute',
+                inset: 0,
+                background: appearancePrefs.customBackground,
+                opacity: customBgOpacity,
+                pointerEvents: 'none',
+              }}
+            />
+          )}
           {workspaces.map((ws) => (
             <div
               key={ws.id}
@@ -896,12 +1572,67 @@ export default function App() {
           ))}
         </div>
 
+        {/* Right: file explorer panel — before the browser so the order is
+            terminals │ explorer │ browser. The explorer sits adjacent to the
+            terminals because that is what it acts on. */}
+        {explorerOpen && (
+          <>
+            <div
+              className="explorer-resize-handle"
+              style={{ width: PANEL_HANDLE_WIDTH, cursor: 'col-resize', flexShrink: 0, position: 'relative' }}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setIsResizingExplorer(true);
+                const startX = e.clientX;
+                const startWidth = activeWorkspace?.explorerWidth ?? explorerWidth;
+                setExplorerWidth(startWidth);
+                let finalWidth = startWidth;
+                const onMove = (ev: MouseEvent) => {
+                  const delta = startX - ev.clientX;
+                  // Reserve the terminal floor, the sidebar (if visible), and
+                  // the browser panel + its handle (if open) — a bare 400px
+                  // ignored both and let this drag alone crush the terminal.
+                  // Shared with the render clamp above via panel-layout.ts.
+                  const reserved = panelReservedWidth({
+                    sidebarWidth: sidebarVisible ? sidebarWidth : 0,
+                    otherPanelOpen: browserOpen,
+                    otherPanelWidth: activeWorkspace?.browserWidth ?? browserWidth,
+                  });
+                  finalWidth = clampPanelWidth(startWidth + delta, {
+                    reserved, min: EXPLORER_MIN_WIDTH, viewportWidth: window.innerWidth,
+                  });
+                  setExplorerWidth(finalWidth);
+                };
+                const onUp = () => {
+                  setIsResizingExplorer(false);
+                  document.removeEventListener('mousemove', onMove);
+                  document.removeEventListener('mouseup', onUp);
+                  // Commit on mouse-up only — a store write per mousemove is
+                  // what browserWidth avoids the same way.
+                  if (activeWorkspaceId) {
+                    updateWorkspaceMetadata(activeWorkspaceId, { explorerWidth: finalWidth });
+                  }
+                };
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+              }}
+            />
+            <div style={{ width: displayExplorerWidth, flexShrink: 0, overflow: 'hidden', position: 'relative' }}>
+              {isResizingExplorer && (
+                <div style={{ position: 'absolute', inset: 0, zIndex: 10, cursor: 'col-resize', background: 'transparent' }} />
+              )}
+              <ExplorerPanel onClose={() => handleToggleExplorer(false)} focusedPaneId={focusedPaneId} />
+            </div>
+          </>
+        )}
+
         {/* Right: browser panel */}
         {browserOpen && (
           <>
             <div
+              className="browser-resize-handle"
               style={{
-                width: 4,
+                width: PANEL_HANDLE_WIDTH,
                 cursor: 'col-resize',
                 flexShrink: 0,
                 position: 'relative',
@@ -915,7 +1646,17 @@ export default function App() {
                 let finalWidth = startWidth;
                 const onMove = (ev: MouseEvent) => {
                   const delta = startX - ev.clientX;
-                  finalWidth = Math.max(250, Math.min(window.innerWidth - 400, startWidth + delta));
+                  // Same reservation as the explorer handle, mirrored: the
+                  // terminal floor, the sidebar (if visible), and the
+                  // explorer panel + its handle (if open).
+                  const reserved = panelReservedWidth({
+                    sidebarWidth: sidebarVisible ? sidebarWidth : 0,
+                    otherPanelOpen: explorerOpen,
+                    otherPanelWidth: activeWorkspace?.explorerWidth ?? explorerWidth,
+                  });
+                  finalWidth = clampPanelWidth(startWidth + delta, {
+                    reserved, min: BROWSER_MIN_WIDTH, viewportWidth: window.innerWidth,
+                  });
                   setBrowserWidth(finalWidth);
                 };
                 const onUp = () => {
@@ -956,7 +1697,7 @@ export default function App() {
                 }}
                 onMouseEnter={(e) => { (e.target as HTMLElement).style.color = '#fff'; (e.target as HTMLElement).style.background = 'rgba(220,50,50,0.7)'; }}
                 onMouseLeave={(e) => { (e.target as HTMLElement).style.color = '#999'; (e.target as HTMLElement).style.background = 'rgba(0,0,0,0.5)'; }}
-                title="Close browser panel"
+                title={t('app.closeBrowserPanel', 'Close browser panel')}
               >×</button>
               {/* Per-workspace browser — all stay mounted, only active visible */}
               {workspaces.map((ws) => (
@@ -970,7 +1711,14 @@ export default function App() {
                 >
                   <BrowserPane
                     surfaceId={`browser-${ws.id}`}
-                    initialUrl={ws.browserUrl}
+                    // `|| undefined`, not `??` (issue #212). A workspace that has
+                    // never opened its browser is saved with `browserUrl: ''`,
+                    // and `''` is a value — it satisfies `??` and defeats
+                    // BrowserPane's default parameter, so a RESTORED workspace
+                    // opened the panel blank while a new one showed the start
+                    // page. Falling through empty is what makes the two agree,
+                    // and what gives `defaultUrl` somewhere to apply.
+                    initialUrl={ws.browserUrl || browserPrefs.defaultUrl || undefined}
                     onUrlChange={(url) => { updateWorkspaceMetadata(ws.id, { browserUrl: url }); }}
                   />
                 </div>
@@ -987,11 +1735,43 @@ export default function App() {
         />
       )}
 
-      {cheatSheetOpen && <ShortcutCheatSheet onClose={() => setCheatSheetOpen(false)} />}
+      {agentNavigatorOpen && (
+        <AgentNavigator
+          onClose={() => setAgentNavigatorOpen(false)}
+          onFocusAgent={focusAgent}
+        />
+      )}
+
+      {hubOpen && (
+        <HubView
+          onClose={() => setHubOpen(false)}
+          onFocusAgent={focusAgent}
+        />
+      )}
+
+      {cheatSheetOpen && <ShortcutCheatSheet onClose={closeCheatSheet} />}
+
+      <ConfirmCloseDialog />
+      <ConfirmCloseSurfaceDialog />
 
       {broadcastInputActive && (
-        <div className="broadcast-input-banner" title="Typed input is sent to every terminal pane in this workspace">
-          Broadcast input ON — typing goes to all panes (Ctrl+Alt+B to stop)
+        <div className="broadcast-input-banner" title={t('app.broadcastInputTooltip', 'Typed input is sent to every terminal pane in this workspace')}>
+          {t('app.broadcastInputBanner', 'Broadcast input ON — typing goes to all panes (Ctrl+Alt+B to stop)')}
+        </div>
+      )}
+
+      {/* Transparency changes that need the window rebuilt. Actionable rather
+          than informational: the setting is already saved, so the only thing
+          left between the user and seeing it is the relaunch. */}
+      {transparencyPending && (
+        <div className="restart-banner" role="status">
+          <span>{t('app.transparencyRestartBanner', 'Transparency change needs a restart to take effect.')}</span>
+          <button
+            className="restart-banner__btn"
+            onClick={() => window.wmux?.window?.relaunch?.()}
+          >
+            {t('app.restartNow', 'Restart now')}
+          </button>
         </div>
       )}
     </div>

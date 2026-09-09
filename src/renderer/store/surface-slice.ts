@@ -5,6 +5,51 @@ import { findLeaf, removeLeaf, splitNode, getAllPaneIds } from './split-utils';
 import { killSurfacePty } from './pty-teardown';
 import { WorkspaceSlice } from './workspace-slice';
 
+// ─── PR badge teardown (issue #4, continued) ──────────────────────────────────
+//
+// Closing the pane/tab that reported a PR used to leave its sidebar badge up
+// forever. A killed PTY never runs a shell-side exit trap, so `clear_pr`
+// never arrives for a Ctrl+W, a tab-× click, or `wmux close-pane` — the store
+// has to notice the loss itself, at the SAME state transitions that already
+// reap the PTY (closeSurface, closePane, closeOtherSurfaces,
+// closeSurfacesToRight — everywhere `killSurfacePty` is called for a real
+// close). `ws.prSurfaceId` (see pr-metadata.ts) says who owns the row, so
+// this only clears when the surface actually leaving IS that owner.
+//
+// Deliberately NOT hooked on `moveSurface` / `splitAndMoveSurface`: the
+// surface — and the PR it owns — keeps existing, it's just relocated to
+// another pane. Both take a single `workspaceId` and move a surface within
+// that workspace's tree, so the owner never leaves the workspace whose row
+// carries the badge and the claim stays answerable.
+//
+// A shell that dies inside a still-open tab (the user types `exit`, or the
+// process falls over) reaches none of those transitions — nothing calls
+// closeSurface/closePane, the tab is still there — so it is answered from the
+// `pty:exit` handler in useTerminal.ts instead, through `clearPrForSurface`
+// below. That is the same place a stuck "Running" badge and a leftover
+// progress indicator are already healed, and it is a signal the renderer gets
+// whether the shell left gracefully or not.
+//
+// Exposed as a store action (rather than kept module-private) so callers
+// outside this slice — `App.tsx`'s `--replace-tab` spawn path, which
+// destroys the reporting surface directly via `pty.kill` instead of going
+// through `closeSurface` — can run the same ownership-gated clear instead of
+// re-deriving it.
+function clearPrIfOwner(
+  get: () => SliceState,
+  workspaceId: WorkspaceId,
+  closingSurfaceIds: readonly SurfaceId[],
+): void {
+  const ws = get().workspaces.find((w) => w.id === workspaceId);
+  if (!ws?.prSurfaceId || !closingSurfaceIds.includes(ws.prSurfaceId)) return;
+  get().updateWorkspaceMetadata(workspaceId, {
+    prNumber: undefined,
+    prStatus: undefined,
+    prLabel: undefined,
+    prSurfaceId: undefined,
+  });
+}
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface SurfaceSlice {
@@ -24,11 +69,87 @@ export interface SurfaceSlice {
       cwd?: string;
       startupCommands?: string[];
       url?: string;
+      /**
+       * This open was triggered by an event, not by the user (the Edit/Write
+       * hook auto-opening a diff tab). Such an open must respect an earlier
+       * dismissal rather than retract it — see `isDiffTabDismissed`.
+       */
+      auto?: boolean;
+      /** An explorer preview tab (see SurfaceRef.ephemeral). */
+      ephemeral?: boolean;
     },
   ) => SurfaceId | null;
 
   /** Close a surface; if it's the last one in the pane, the pane is removed */
   closeSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId) => void;
+
+  /**
+   * Drop the workspace's PR badge iff `ws.prSurfaceId` is one of
+   * `destroyedSurfaceIds` — a no-op otherwise (unowned badge, or the owner
+   * isn't in the list). Every in-slice close path (closeSurface, closePane,
+   * closeOtherSurfaces, closeSurfacesToRight) already runs this at the same
+   * transition that reaps the PTY; this is the same check exposed for a
+   * caller OUTSIDE the slice that destroys a surface a different way (see
+   * `App.tsx`'s `--replace-tab` spawn path, which calls `pty.kill` directly
+   * rather than routing through `closeSurface`) — so that path doesn't have
+   * to re-derive the ownership rule to avoid leaving an unclearable badge.
+   */
+  clearPrIfSurfaceOwner: (workspaceId: WorkspaceId, destroyedSurfaceIds: readonly SurfaceId[]) => void;
+
+  /**
+   * Drop the PR badge owned by `surfaceId`, wherever it lives — the same
+   * ownership-gated clear, for a caller that knows only the surface. Used by
+   * the `pty:exit` handler in useTerminal.ts: a shell can die with its tab
+   * still open (the user types `exit`, or the process falls over), and there
+   * is no close transition for that at all, so nothing else would notice the
+   * pane that reported the PR is no longer able to speak for it.
+   */
+  clearPrForSurface: (surfaceId: SurfaceId) => void;
+
+  /**
+   * The path behind every USER close gesture for a tab (the tab ×, Ctrl+W).
+   * Closes immediately unless the surface holds unsaved markdown edits (issue
+   * #116, F3), in which case it parks the request in `pendingCloseSurface` for
+   * the confirmation dialog. Programmatic closes (`wmux close-surface`) call
+   * closeSurface directly and never see the dialog — a CLI call must not block
+   * on a modal nobody is looking at.
+   *
+   * reopenClosedSurface (Ctrl+Shift+T) does make an accidental close
+   * recoverable, but "recoverable via a shortcut you may not know" is not good
+   * enough for text the user typed.
+   */
+  requestCloseSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId) => void;
+  pendingCloseSurface: { workspaceId: WorkspaceId; paneId: PaneId; surfaceId: SurfaceId; label: string } | null;
+  confirmPendingCloseSurface: () => void;
+  cancelPendingCloseSurface: () => void;
+
+  /**
+   * Close a whole pane, reaping every shell it holds.
+   *
+   * Lives in the store rather than in PaneWrapper so the UI button, `wmux
+   * close-pane` and closeSurface's last-tab path share ONE implementation —
+   * the same reasoning pty-teardown.ts records for PTY reaping. The three
+   * copies this replaces had each independently gotten the last-pane case
+   * wrong, in the same way.
+   *
+   * Closing the workspace's only pane closes the workspace: a workspace with
+   * zero panes cannot be rendered, and `removeLeaf` correctly reports that
+   * nothing is left.
+   */
+  closePane: (workspaceId: WorkspaceId, paneId: PaneId) => void;
+
+  /**
+   * Open a copy of a surface in the same pane: same type, shell, color and
+   * (current) directory, but a fresh instance. Returns the new SurfaceId, or
+   * null if the source no longer exists.
+   */
+  duplicateSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId) => SurfaceId | null;
+
+  /** Close every other surface in the pane, keeping only `keepSurfaceId` */
+  closeOtherSurfaces: (workspaceId: WorkspaceId, paneId: PaneId, keepSurfaceId: SurfaceId) => void;
+
+  /** Close every surface positioned after `fromSurfaceId` in the pane */
+  closeSurfacesToRight: (workspaceId: WorkspaceId, paneId: PaneId, fromSurfaceId: SurfaceId) => void;
 
   /** Advance to the next surface in the pane (wraps around) */
   nextSurface: (workspaceId: WorkspaceId, paneId: PaneId) => void;
@@ -57,14 +178,33 @@ export interface SurfaceSlice {
   renameSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId, customTitle: string) => void;
 
   /** Update a surface without moving it */
-  updateSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId, patch: Partial<SurfaceRef>) => void;
+  /**
+   * Patch one surface in place.
+   *
+   * `shell` is deliberately not patchable: it is the spec the surface respawns
+   * from, and writing a resolved executable into it is what broke restore for
+   * every `ssh user@host` pane. Display values belong in `resolvedShell`.
+   * (Saved-layout templates edit `shell` through patchLeafPrimarySurface, which
+   * rebuilds the node rather than going through here.)
+   */
+  updateSurface: (workspaceId: WorkspaceId, paneId: PaneId, surfaceId: SurfaceId, patch: Partial<Omit<SurfaceRef, 'id' | 'type' | 'shell'>>) => void;
 
   /**
    * Set rendered markdown content on a surface, found by id across all
    * workspaces/panes (issue #54). Callers from the pipe bridge only know the
    * surfaceId, so this locates the owning pane itself.
+   *
+   * Takes an options object rather than positional args (issue #116) so the
+   * next field doesn't become a fourth parameter. A bare string is still
+   * accepted as `fileName` for compatibility with the `executeJavaScript`
+   * call the main process emits, which may be from an older build during a
+   * hot-swap.
    */
-  setMarkdownContent: (surfaceId: SurfaceId, content: string) => void;
+  setMarkdownContent: (
+    surfaceId: SurfaceId,
+    content: string,
+    options?: string | { fileName?: string; filePath?: string; mtimeMs?: number; dirty?: boolean },
+  ) => void;
 
   /** Split a pane and move a surface into the new pane (drag to edge) */
   splitAndMoveSurface: (
@@ -74,6 +214,40 @@ export interface SurfaceSlice {
     surfaceId: SurfaceId,
     direction: 'left' | 'right' | 'up' | 'down',
   ) => void;
+}
+
+/**
+ * Build the surface patch for a markdown content update.
+ *
+ * The subtle rule is which fields a content-only push is allowed to touch. Only
+ * a load *from a file* may set the tab label and backing path — otherwise
+ * `wmux markdown set --content` against a file-backed surface would silently
+ * re-point or clear the path it saves and reloads from.
+ *
+ * Dirty state follows the same reasoning (F3, issue #116): a load from disk
+ * carries an mtime and leaves the buffer clean, while pushing text into a
+ * file-backed surface makes the buffer differ from disk — which is a user edit
+ * in every way that matters, so it is marked dirty rather than auto-written.
+ */
+export function markdownContentPatch(
+  existing: SurfaceRef,
+  content: string,
+  opts: { fileName?: string; filePath?: string; mtimeMs?: number; dirty?: boolean } = {},
+): Partial<SurfaceRef> {
+  const patch: Partial<SurfaceRef> = { markdownContent: content };
+  if (opts.fileName) patch.markdownFileName = opts.fileName;
+  if (opts.filePath) patch.markdownFilePath = opts.filePath;
+  if (opts.mtimeMs !== undefined) patch.markdownFileMtime = opts.mtimeMs;
+  if (opts.dirty !== undefined) {
+    patch.markdownDirty = opts.dirty;
+  } else {
+    patch.markdownDirty = !opts.filePath && !!existing.markdownFilePath;
+  }
+  // Editing promotes: a surface the user (or an agent via markdown.set_content)
+  // has changed is no longer disposable, so a click in the tree must not
+  // recycle it. Only a load FROM A FILE leaves it disposable.
+  if (patch.markdownDirty && !opts.filePath) patch.ephemeral = undefined;
+  return patch;
 }
 
 // ─── Helper: update a leaf's surfaces in the split tree ──────────────────────
@@ -91,14 +265,52 @@ interface ClosedSurface {
   cwd?: string;
   startupCommands?: string[];
   url?: string;
+  // What a `code` tab actually is. Carried so Ctrl+Shift+T reopens the FILE
+  // rather than an empty code surface — see pushClosedSurface.
+  codeFilePath?: string;
+  codeFileName?: string;
+  codeRelPath?: string;
+  codeRootSurfaceId?: SurfaceId;
+  /**
+   * Which workspace this tab was closed in. The reopen stack is GLOBAL, so
+   * Ctrl+Shift+T in workspace B can pop a tab closed in workspace A — and a
+   * code tab's root is a surface id belonging to A. Installing it in B points
+   * CodePane at another workspace's terminal, or at a dead id once A is gone:
+   * the same cross-workspace pointer the explorer's sticky root was scoped to
+   * prevent (see usableSticky in explorer-state.ts).
+   */
+  workspaceId?: WorkspaceId;
 }
 const closedSurfaceStack: ClosedSurface[] = [];
 const MAX_CLOSED_SURFACES = 25;
 
-function pushClosedSurface(surface: SurfaceRef): void {
-  // Diff surfaces are auto-generated from hook events (issue #63) — reopening a
-  // stale one is noise, so don't track them.
-  if (surface.type === 'diff') return;
+// Workspaces where the user closed the auto-opened diff tab (issue #141).
+// Session-scoped, like the reopen stack: closing it used to last only until the
+// next Edit/Write hook fired, so the tab resurrected itself minutes later with
+// no user action — and on a large repo its polling was what made typing lag.
+// A tab the user dismissed stays dismissed until they ask for a diff again.
+const diffTabDismissed = new Set<WorkspaceId>();
+
+/** True if the user closed this workspace's diff tab and hasn't reopened one. */
+export function isDiffTabDismissed(workspaceId: WorkspaceId): boolean {
+  return diffTabDismissed.has(workspaceId);
+}
+
+/**
+ * Bookkeeping every close path owes a surface it is about to drop.
+ *
+ * Diff surfaces are auto-generated from hook events (issue #63), so reopening a
+ * stale one via Ctrl+Shift+T is noise — but the close still has to be recorded,
+ * or the next Edit/Write hook puts the tab straight back (issue #141).
+ */
+function pushClosedSurface(workspaceId: WorkspaceId, surface: SurfaceRef): void {
+  if (surface.type === 'diff') {
+    diffTabDismissed.add(workspaceId);
+    return;
+  }
+  // A preview tab is disposable by definition — Ctrl+Shift+T should bring
+  // back the tab the user meant to keep, not the last thing they glanced at.
+  if (surface.ephemeral) return;
   closedSurfaceStack.push({
     type: surface.type,
     colorScheme: surface.colorScheme,
@@ -107,13 +319,32 @@ function pushClosedSurface(surface: SurfaceRef): void {
     cwd: surface.cwd,
     startupCommands: surface.startupCommands,
     url: surface.url,
+    // A code tab IS its file. Without these it reopens as a code surface with
+    // nothing to read and reports `invalid_path` — which reads as a bug rather
+    // than as the empty tab it is. `codeContent` is deliberately absent: the
+    // buffer is never persisted (see SurfaceRef.codeContent) and CodePane
+    // refills it from the path on mount.
+    codeFilePath: surface.codeFilePath,
+    codeFileName: surface.codeFileName,
+    codeRelPath: surface.codeRelPath,
+    codeRootSurfaceId: surface.codeRootSurfaceId,
+    workspaceId,
   });
   if (closedSurfaceStack.length > MAX_CLOSED_SURFACES) closedSurfaceStack.shift();
 }
 
 // ─── Slice creator ───────────────────────────────────────────────────────────
 
-export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> = (_set, get) => ({
+export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> = (set, get) => ({
+  clearPrIfSurfaceOwner(workspaceId, destroyedSurfaceIds) {
+    clearPrIfOwner(get, workspaceId, destroyedSurfaceIds);
+  },
+
+  clearPrForSurface(surfaceId) {
+    const ws = get().workspaces.find((w) => w.prSurfaceId === surfaceId);
+    if (ws) clearPrIfOwner(get, ws.id, [surfaceId]);
+  },
+
   addSurface(workspaceId, paneId, type, options) {
     const surfaceId: SurfaceId = `surf-${uuid()}` as SurfaceId;
 
@@ -124,6 +355,12 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     const leaf = findLeaf(ws.splitTree, paneId);
     if (!leaf) return null;
 
+    // Asking for a diff tab retracts an earlier dismissal, so the auto-open
+    // behaviour resumes for this workspace (issue #141). `options.auto` marks
+    // the hook-driven open, which must not clear it — that is the loop the
+    // dismissal exists to break.
+    if (type === 'diff' && !options?.auto) diffTabDismissed.delete(workspaceId);
+
     const newSurface: SurfaceRef = {
       id: surfaceId,
       type,
@@ -133,6 +370,7 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
       ...(options?.cwd ? { cwd: options.cwd } : {}),
       ...(options?.startupCommands?.length ? { startupCommands: options.startupCommands } : {}),
       ...(options?.url ? { url: options.url } : {}),
+      ...(options?.ephemeral ? { ephemeral: true } : {}),
     };
     const newSurfaces = [...leaf.surfaces, newSurface];
     const newActiveSurfaceIndex = newSurfaces.length - 1;
@@ -145,6 +383,58 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
 
     updateSplitTree(workspaceId, updatedTree);
     return surfaceId;
+  },
+
+  duplicateSurface(workspaceId, paneId, surfaceId) {
+    const { workspaces } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return null;
+
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (!leaf) return null;
+
+    const src = leaf.surfaces.find((s) => s.id === surfaceId);
+    if (!src) return null;
+
+    // Copy the tab's config, preferring its live directory so the new terminal
+    // opens where the source currently is. Startup commands are intentionally
+    // NOT replayed — duplicating an agent tab shouldn't relaunch the agent.
+    return get().addSurface(workspaceId, paneId, src.type, {
+      shell: src.shell,
+      cwd: src.currentCwd || src.cwd,
+      colorScheme: src.colorScheme,
+      url: src.url,
+    });
+  },
+
+  pendingCloseSurface: null,
+
+  requestCloseSurface(workspaceId, paneId, surfaceId) {
+    const { workspaces, closeSurface } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    const surface = ws && findLeaf(ws.splitTree, paneId)?.surfaces.find((s) => s.id === surfaceId);
+    if (!surface?.markdownDirty) {
+      closeSurface(workspaceId, paneId, surfaceId);
+      return;
+    }
+    set({
+      pendingCloseSurface: {
+        workspaceId,
+        paneId,
+        surfaceId,
+        label: surface.markdownFileName || 'this note',
+      },
+    });
+  },
+
+  confirmPendingCloseSurface() {
+    const pending = get().pendingCloseSurface;
+    set({ pendingCloseSurface: null });
+    if (pending) get().closeSurface(pending.workspaceId, pending.paneId, pending.surfaceId);
+  },
+
+  cancelPendingCloseSurface() {
+    set({ pendingCloseSurface: null });
   },
 
   closeSurface(workspaceId, paneId, surfaceId) {
@@ -161,20 +451,20 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     // this action, and neither used to kill the PTY (only the tab-× button did).
     const closing = leaf.surfaces.find((s) => s.id === surfaceId);
     if (closing) {
-      pushClosedSurface(closing);
+      pushClosedSurface(workspaceId, closing);
       killSurfacePty(closing);
+      clearPrIfOwner(get, workspaceId, [closing.id]);
     }
 
     const newSurfaces = leaf.surfaces.filter((s) => s.id !== surfaceId);
 
     if (newSurfaces.length === 0) {
-      // No surfaces left — remove the pane entirely
-      const newTree = removeLeaf(ws.splitTree, paneId);
-      if (newTree) {
-        updateSplitTree(workspaceId, newTree);
-      }
-      // If newTree is null the workspace has no panes; leave it intact
-      // (workspace-level empty state is handled elsewhere)
+      // Last tab in the pane — this is a pane close, so use the pane close.
+      // It was previously inlined here and got the single-pane case wrong:
+      // removeLeaf returns null for a one-leaf tree, `if (newTree)` skipped the
+      // update, and the function returned having ALREADY reaped the shell above
+      // — leaving a dead tab that could never be closed.
+      get().closePane(workspaceId, paneId);
       return;
     }
 
@@ -185,6 +475,98 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
       activeSurfaceIndex: newActiveIndex,
     });
 
+    updateSplitTree(workspaceId, updatedTree);
+  },
+
+  closePane(workspaceId, paneId) {
+    const { workspaces, updateSplitTree, closeWorkspace } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return;
+
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (!leaf) return;
+
+    // ORDER IS THE WHOLE FIX: decide BEFORE destroying anything.
+    //
+    // All three previous copies killed the pane's PTYs first and only then asked
+    // removeLeaf what the tree should become. When the answer was null — the
+    // pane was the workspace's only one, which is what `wmux new-workspace`
+    // creates — they read it as "nothing to do" and returned, having already
+    // killed a dev server, an agent and every shell in the pane. The UI was
+    // unchanged, so nothing told the user it had happened.
+    const newTree = removeLeaf(ws.splitTree, paneId);
+
+    if (!newTree) {
+      // Nothing would be left. A workspace with zero panes cannot be rendered,
+      // so this closes the workspace — which reaps the whole subtree itself.
+      closeWorkspace(workspaceId);
+      return;
+    }
+
+    for (const surface of leaf.surfaces) {
+      if (surface.type === 'diff') diffTabDismissed.add(workspaceId);
+      killSurfacePty(surface);
+    }
+    clearPrIfOwner(get, workspaceId, leaf.surfaces.map((s) => s.id));
+    updateSplitTree(workspaceId, newTree);
+  },
+
+  closeOtherSurfaces(workspaceId, paneId, keepSurfaceId) {
+    const { workspaces, updateSplitTree } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return;
+
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (!leaf) return;
+
+    const keep = leaf.surfaces.find((s) => s.id === keepSurfaceId);
+    if (!keep) return;
+    if (leaf.surfaces.length === 1) return;
+
+    // Reap the shells we're dropping and remember them for Ctrl+Shift+T,
+    // mirroring the bookkeeping in closeSurface (issues #64, #65).
+    const dropped: SurfaceId[] = [];
+    for (const s of leaf.surfaces) {
+      if (s.id === keepSurfaceId) continue;
+      pushClosedSurface(workspaceId, s);
+      killSurfacePty(s);
+      dropped.push(s.id);
+    }
+    clearPrIfOwner(get, workspaceId, dropped);
+
+    const updatedTree = patchLeaf(ws.splitTree, paneId, {
+      surfaces: [keep],
+      activeSurfaceIndex: 0,
+    });
+    updateSplitTree(workspaceId, updatedTree);
+  },
+
+  closeSurfacesToRight(workspaceId, paneId, fromSurfaceId) {
+    const { workspaces, updateSplitTree } = get();
+    const ws = workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return;
+
+    const leaf = findLeaf(ws.splitTree, paneId);
+    if (!leaf) return;
+
+    const idx = leaf.surfaces.findIndex((s) => s.id === fromSurfaceId);
+    if (idx === -1 || idx === leaf.surfaces.length - 1) return;
+
+    // Reap the shells to the right and remember them for Ctrl+Shift+T,
+    // mirroring the bookkeeping in closeSurface (issues #64, #65).
+    const dropped = leaf.surfaces.slice(idx + 1);
+    for (const s of dropped) {
+      pushClosedSurface(workspaceId, s);
+      killSurfacePty(s);
+    }
+    clearPrIfOwner(get, workspaceId, dropped.map((s) => s.id));
+
+    const newSurfaces = leaf.surfaces.slice(0, idx + 1);
+    const newActiveIndex = Math.min(leaf.activeSurfaceIndex, newSurfaces.length - 1);
+    const updatedTree = patchLeaf(ws.splitTree, paneId, {
+      surfaces: newSurfaces,
+      activeSurfaceIndex: newActiveIndex,
+    });
     updateSplitTree(workspaceId, updatedTree);
   },
 
@@ -273,8 +655,8 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
   reopenClosedSurface(workspaceId, paneId) {
     const restored = closedSurfaceStack.pop();
     if (!restored) return null;
-    const { addSurface } = get();
-    return addSurface(workspaceId, paneId, restored.type, {
+    const { addSurface, updateSurface } = get();
+    const reopenedId = addSurface(workspaceId, paneId, restored.type, {
       ...(restored.colorScheme ? { colorScheme: restored.colorScheme } : {}),
       ...(restored.customTitle ? { customTitle: restored.customTitle } : {}),
       ...(restored.shell ? { shell: restored.shell } : {}),
@@ -282,6 +664,31 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
       ...(restored.startupCommands ? { startupCommands: restored.startupCommands } : {}),
       ...(restored.url ? { url: restored.url } : {}),
     });
+    // Applied AFTER creation, the way open-preview.ts fills a code tab in:
+    // addSurface's options are the fields a NEW surface is spawned from, and a
+    // code tab's file is not one of them. Passing them there compiles — an
+    // object spread carries no excess-property check — and is silently dropped,
+    // which is how this looked fixed while Ctrl+Shift+T still gave back a blank
+    // pane.
+    if (reopenedId && restored.codeFilePath && restored.workspaceId === workspaceId) {
+      // The root must still be a surface that EXISTS. A code tab whose terminal
+      // was closed in the meantime restores an id nothing answers for, and
+      // CodePane waits on that surface's `currentCwd` before reading — a signal
+      // that will never arrive, so the tab sits blank forever with no error to
+      // explain it. Dropping the dead root turns that into `invalid_path`,
+      // which at least says something true.
+      const ws = get().workspaces.find((w) => w.id === workspaceId);
+      const rootAlive = !!restored.codeRootSurfaceId && !!ws && getAllPaneIds(ws.splitTree).some(
+        (pid) => findLeaf(ws.splitTree, pid)?.surfaces.some((s) => s.id === restored.codeRootSurfaceId),
+      );
+      updateSurface(workspaceId, paneId, reopenedId, {
+        codeFilePath: restored.codeFilePath,
+        codeFileName: restored.codeFileName,
+        codeRelPath: restored.codeRelPath,
+        ...(rootAlive ? { codeRootSurfaceId: restored.codeRootSurfaceId } : {}),
+      });
+    }
+    return reopenedId;
   },
 
   reorderSurface(workspaceId, paneId, surfaceId, newIndex) {
@@ -335,15 +742,16 @@ export const createSurfaceSlice: StateCreator<SliceState, [], [], SurfaceSlice> 
     updateSplitTree(workspaceId, updatedTree);
   },
 
-  setMarkdownContent(surfaceId, content) {
+  setMarkdownContent(surfaceId, content, options) {
     const { workspaces, updateSurface } = get();
+    const opts = typeof options === 'string' ? { fileName: options } : (options ?? {});
     for (const ws of workspaces) {
       for (const paneId of getAllPaneIds(ws.splitTree)) {
         const leaf = findLeaf(ws.splitTree, paneId);
-        if (leaf?.surfaces.some((s) => s.id === surfaceId)) {
-          updateSurface(ws.id, paneId, surfaceId, { markdownContent: content });
-          return;
-        }
+        const existing = leaf?.surfaces.find((s) => s.id === surfaceId);
+        if (!existing) continue;
+        updateSurface(ws.id, paneId, surfaceId, markdownContentPatch(existing, content, opts));
+        return;
       }
     }
   },

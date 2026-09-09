@@ -1,3 +1,9 @@
+/* The surface tab bar's height. Shared, because a divider runs the full height
+   of the panes it separates and has to know where their opaque chrome ends. */
+:root {
+  --wmux-tab-bar-h: 28px;
+}
+
 .split-container {
   display: flex;
   width: 100%;
@@ -11,14 +17,14 @@
 .split-divider--horizontal { width: 6px; cursor: col-resize; }
 .split-divider--vertical { height: 6px; cursor: row-resize; }
 .split-divider__line { position: absolute; background: rgba(var(--ui-overlay-rgb), 0.06); transition: background 0.15s ease, transform 0.15s ease; will-change: transform, background; }
-.split-divider:hover .split-divider__line { background: rgba(0, 145, 255, 0.4); }
+.split-divider:hover .split-divider__line { background: rgba(var(--ui-accent-rgb), 0.4); }
 .split-divider--horizontal .split-divider__line { width: 2px; height: 100%; left: 50%; transform: translateX(-50%) scaleX(0.5); }
 .split-divider--vertical .split-divider__line { height: 2px; width: 100%; top: 50%; transform: translateY(-50%) scaleY(0.5); }
 .split-divider:hover .split-divider--horizontal .split-divider__line { transform: translateX(-50%) scaleX(1); }
 .split-divider:hover .split-divider--vertical .split-divider__line { transform: translateY(-50%) scaleY(1); }
 
 /* Keep the line highlighted for the whole drag, not just while hovered. */
-.split-divider--dragging .split-divider__line { background: rgba(0, 145, 255, 0.6); }
+.split-divider--dragging .split-divider__line { background: rgba(var(--ui-accent-rgb), 0.6); }
 .split-divider--dragging.split-divider--horizontal .split-divider__line { transform: translateX(-50%) scaleX(1); }
 .split-divider--dragging.split-divider--vertical .split-divider__line { transform: translateY(-50%) scaleY(1); }
 
@@ -38,7 +44,56 @@
   transition: border-color 0.15s ease;
 }
 .pane-wrapper--focused {
-  border-color: rgba(0, 145, 255, 0.3);
+  border-color: rgba(var(--ui-accent-rgb), 0.3);
+}
+/* Over a translucent window the gutters between panes must render at the same
+   opacity the panes do, or a split shows as bright seams through the terminal.
+   `:not(--focused)` keeps the accent border on the focused pane, which would
+   otherwise lose to this rule on specificity; the rule below is what that pane
+   gets instead. */
+html.wmux-transparent .pane-wrapper:not(.pane-wrapper--focused) {
+  border-color: var(--wmux-pane-gutter, var(--ui-bg-2));
+}
+/* Which left the focus ring as the only edge still compositing onto the
+   desktop. 30% accent over an opaque window resolves against the chrome behind
+   it and reads as a solid line; over a transparent one there is nothing behind
+   it, so the same colour reads as a slot cut around the pane that you can see
+   the wallpaper through.
+
+   Tracking the pane's alpha does not fix it either, because the ring's
+   neighbours disagree: the top 28px inside the pane is the surface tab bar,
+   opaque chrome, so a translucent ring runs as a see-through line between the
+   opaque titlebar above it and the opaque tab bar below. No single
+   border-color matches opaque chrome on one edge and a translucent terminal on
+   the others. --wmux-pane-ring is therefore the theme colour with 30% accent
+   mixed in at FULL opacity — the focus ring is an indicator, which is chrome,
+   and chrome here is opaque. usePaneFill does the mix. The fallback is the
+   plain accent rule, which is what a custom background wants anyway — there
+   the fill is transparent because that layer is the surface. */
+html.wmux-transparent .pane-wrapper--focused {
+  border-color: var(--wmux-pane-ring, rgba(var(--ui-accent-rgb), 0.3));
+}
+html.wmux-transparent .split-divider {
+  background: var(--wmux-pane-gutter, var(--ui-bg-2));
+}
+/* Except across the tab bars. A divider between two side-by-side panes runs the
+   whole pane height, and the top 28px of a pane is its surface tab bar, which is
+   opaque. The pane fill is exactly right for the rest of that run — sampled at a
+   content row the divider and the pane beside it come out identical — and wrong
+   for that one band, where a translucent divider reads as a slot cut between two
+   opaque tab bars. So it is opaque for the height of the tab bars it sits
+   between, and the pane fill below them.
+
+   Vertical dividers need no equivalent: they separate one pane's content from
+   the NEXT pane's tab bar, so the fill already matches the surface immediately
+   above them, which is the side that would otherwise show a seam. */
+html.wmux-transparent .split-divider--horizontal {
+  background: linear-gradient(
+    to bottom,
+    var(--ui-bg-2) 0,
+    var(--ui-bg-2) var(--wmux-tab-bar-h),
+    var(--wmux-pane-gutter, var(--ui-bg-2)) var(--wmux-tab-bar-h)
+  );
 }
 .pane-wrapper__content {
   flex: 1;
@@ -58,8 +113,8 @@
 .surface-tab-bar {
   display: flex;
   align-items: center;
-  height: 28px;
-  min-height: 28px;
+  height: var(--wmux-tab-bar-h);
+  min-height: var(--wmux-tab-bar-h);
   background: var(--ui-bg-2);
   overflow: visible;
   flex-shrink: 0;
@@ -89,13 +144,38 @@
   border-right: 1px solid var(--ui-bg-0);
   user-select: none;
   transition: background 0.1s ease, color 0.1s ease;
+  position: relative; /* anchor for the OSC 9;4 progress strip */
+}
+
+/* OSC 9;4 progress strip along the tab's bottom edge.
+   --s1 normal, --s2 error, --s3 indeterminate, --s4 paused/warning. */
+.surface-tab__progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--ui-accent);
+  pointer-events: none;
+  transition: width 0.2s ease;
+}
+.surface-tab__progress--s2 { background: #e53935; }
+.surface-tab__progress--s4 { background: #fb8c00; }
+.surface-tab__progress--s3 {
+  width: 100%;
+  background: repeating-linear-gradient(90deg, var(--ui-accent) 0 8px, transparent 8px 16px);
+  animation: surface-tab-progress-slide 1s linear infinite;
+}
+@keyframes surface-tab-progress-slide {
+  from { background-position-x: 0; }
+  to { background-position-x: 16px; }
 }
 .surface-tab:hover { background: var(--ui-bg-5); color: var(--ui-text-secondary); }
 .surface-tab--active { background: var(--ui-border); color: var(--ui-text-primary); }
 .surface-tab__label { pointer-events: none; }
+.surface-tab__label--ephemeral { font-style: italic; }
 .surface-tab__rename-input {
   background: rgba(var(--ui-overlay-rgb), 0.1);
-  border: 1px solid rgba(0, 145, 255, 0.5);
+  border: 1px solid rgba(var(--ui-accent-rgb), 0.5);
   color: var(--ui-text-primary);
   font-size: 11px;
   font-family: inherit;
@@ -160,7 +240,7 @@
 .surface-tab-bar__ctl:hover { background: rgba(var(--ui-overlay-rgb),0.10); color: var(--ui-text-primary); }
 /* per-control accent colors */
 .surface-tab-bar__ctl--new:hover { color: #5fb85f; background: rgba(95,184,95,0.12); }
-.surface-tab-bar__ctl--layout:hover { color: #0091ff; background: rgba(0,145,255,0.12); }
+.surface-tab-bar__ctl--layout:hover { color: var(--ui-accent); background: rgba(var(--ui-accent-rgb), 0.12); }
 .surface-tab-bar__ctl--close:hover { color: #ff6b6b; background: rgba(255,100,100,0.14); }
 
 /* ─── Control-cluster dropdowns (portalled to document.body) ─────────────── */
@@ -189,7 +269,7 @@
   border-radius: 5px;
   cursor: pointer;
 }
-.surface-tab-menu button:hover { background: rgba(0,145,255,0.18); color: var(--ui-text-primary); }
+.surface-tab-menu button:hover { background: rgba(var(--ui-accent-rgb), 0.18); color: var(--ui-text-primary); }
 .surface-tab-menu__icon {
   display: inline-flex;
   align-items: center;
@@ -223,10 +303,10 @@
 }
 
 .surface-tab--agent .surface-tab__icon {
-  color: #0091FF;
+  color: var(--ui-accent);
 }
 .surface-tab--agent .surface-tab__label {
-  color: rgba(0, 145, 255, 0.8);
+  color: rgba(var(--ui-accent-rgb), 0.8);
 }
 
 /* ─── Drag and drop ──────────────────────────────────────────────────────── */
@@ -456,4 +536,51 @@ body.wmux-dragging * {
   color: rgba(255, 255, 255, 0.86);
   font-size: 10px;
   border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* ─── Agent state on a tab (phase 4) ──────────────────────────────────────
+   A blocked agent in a BACKGROUND tab used to be invisible: the sidebar said
+   its workspace needed you, and nothing in the pane said which tab. The dot
+   sits before the icon and uses the same vocabulary as the sidebar — violet
+   "needs you", amber working — because a user who learned it there must not
+   have to relearn it here.
+
+   Only blocked and working are drawn. Idle needs no mark: a tab that is fine
+   should look like every other tab, and marking all four states would make the
+   one that matters harder to find, not easier. */
+.surface-tab[data-agent-state='blocked'],
+.surface-tab[data-agent-state='working'] {
+  padding-left: 4px;
+}
+
+.surface-tab[data-agent-state='blocked']::before,
+.surface-tab[data-agent-state='working']::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 3px;
+}
+
+.surface-tab[data-agent-state='working']::before {
+  background: #e8a33d;
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+.surface-tab[data-agent-state='blocked']::before {
+  background: var(--ui-agent-blocked);
+  animation: pulse-blocked-dot 2s ease-in-out infinite;
+}
+
+/* An inactive blocked tab is the case this exists for, so it gets more than the
+   dot: the label stops being dimmed and takes the colour too. */
+.surface-tab[data-agent-state='blocked']:not(.surface-tab--active) .surface-tab__label {
+  color: var(--ui-agent-blocked);
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .surface-tab[data-agent-state='blocked']::before,
+  .surface-tab[data-agent-state='working']::before { animation: none; }
 }

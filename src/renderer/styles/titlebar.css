@@ -42,6 +42,51 @@
 .titlebar__right {
   width: 140px;
   flex-shrink: 0;
+  /* Stretched, not centred like its siblings. The caption buttons inside are
+     sized with height:100%, and a percentage height against a parent that has
+     none resolves to auto — so without this they collapsed onto the only thing
+     in the chain with a real size, the 10px icon, and the hover fill rendered
+     as a narrow band floating in the middle of the titlebar. */
+  align-self: stretch;
+  /* Cancels .titlebar's 8px right padding so the buttons reach the corner, the
+     way the native overlay does — the top-right corner is an infinitely large
+     mouse target only if nothing sits between it and Close. */
+  margin-right: -8px;
+}
+
+/* Caption buttons for frameless (clear-transparency) windows. The reserved
+   140px above is what titleBarOverlay occupies on framed windows, so these land
+   in the same place and nothing else in the titlebar shifts between modes. */
+.titlebar__window-controls {
+  display: flex;
+  justify-content: flex-end;
+  height: 100%;
+  /* The titlebar is a drag region; buttons inside one never receive clicks
+     unless they opt out of it. */
+  -webkit-app-region: no-drag;
+}
+.titlebar__wc {
+  width: 46px;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: rgba(var(--ui-overlay-rgb), 0.65);
+  transition: background 0.1s, color 0.1s;
+}
+.titlebar__wc:hover {
+  background: rgba(var(--ui-overlay-rgb), 0.1);
+  color: rgba(var(--ui-overlay-rgb), 0.95);
+}
+/* Windows convention: close goes red on hover, and white regardless of theme
+   because it sits on a saturated red rather than on the titlebar. */
+.titlebar__wc--close:hover {
+  background: #c42b1c;
+  color: #ffffff;
 }
 
 .titlebar__btn {
@@ -100,4 +145,56 @@
 @keyframes wmux-update-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
   50%      { box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.18); }
+}
+
+/* ─── In-app update phases (issue #125) ──────────────────────────────────────
+   The badge is now a progress surface, not just a link. While work is in
+   flight the pulse stops — a moving percentage already says "something is
+   happening", and two competing animations read as noise. */
+
+.titlebar__update-badge--checking,
+.titlebar__update-badge--downloading {
+  animation: none;
+  color: #93c5fd;
+  border-color: rgba(147, 197, 253, 0.35);
+  background: rgba(147, 197, 253, 0.08);
+  cursor: default;
+  opacity: 1; /* it is disabled, but it is not inactive — keep it legible */
+}
+
+.titlebar__update-badge--downloading .titlebar__update-badge__arrow {
+  animation: wmux-update-bob 1.1s ease-in-out infinite;
+}
+
+/* Ready to restart: warmer than "available", so the state change is visible
+   without reading the label. */
+.titlebar__update-badge--ready {
+  color: #fbbf24;
+  border-color: rgba(251, 191, 36, 0.4);
+  background: rgba(251, 191, 36, 0.1);
+}
+
+.titlebar__update-badge--ready:hover {
+  color: #fcd34d;
+  background: rgba(251, 191, 36, 0.18);
+  border-color: rgba(251, 191, 36, 0.6);
+}
+
+.titlebar__update-badge--error {
+  animation: none;
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.1);
+}
+
+@keyframes wmux-update-bob {
+  0%, 100% { transform: translateY(1px); }
+  50%      { transform: translateY(-1px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .titlebar__update-badge,
+  .titlebar__update-badge--downloading .titlebar__update-badge__arrow {
+    animation: none;
+  }
 }

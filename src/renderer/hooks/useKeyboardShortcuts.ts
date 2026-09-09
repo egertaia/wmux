@@ -2,52 +2,52 @@ import { useEffect } from 'react';
 import { useStore } from '../store';
 import { ShortcutBinding, ShortcutAction } from '../store/settings-slice';
 import { splitNode, removeLeaf, getAllPaneIds, findLeaf, adjustPaneRatio } from '../store/split-utils';
+import { rollupAgents } from '../store/agent-rollup';
+import { focusAgentTarget } from '../store/focus-agent';
 import { PaneId, SplitNode } from '../../shared/types';
+import { trimTrailingWhitespace } from '../utils/copy-text';
+import { GLOBAL_IN_EDITOR, isEditableTarget } from './shortcut-target';
+import { matchIndexShortcut, resolveIndexTarget } from '../utils/index-shortcuts';
+import { isSafeToIntercept } from '../utils/shortcut-binding';
+import { followOutputFor, togglePinnedPromptFor, togglePromptOutlineFor } from '../store/prompt-actions';
 import { v4 as uuid } from 'uuid';
+import { useT } from '../i18n';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function matchesBinding(e: KeyboardEvent, binding: ShortcutBinding): boolean {
+/**
+ * Unshifted character for each punctuation key, by physical code.
+ *
+ * Only consulted when the direct e.key comparison already failed AND Shift is
+ * held, so a non-US layout is unaffected: there the recorder stored whatever
+ * e.key produced, and that matches directly. This exists to rescue the shipped
+ * US-layout defaults (`Ctrl+Shift+[` / `Ctrl+Shift+]`), which are written as
+ * the unshifted character but can only ever arrive as the shifted one.
+ */
+const UNSHIFTED_BY_CODE: Readonly<Record<string, string>> = {
+  BracketLeft: '[', BracketRight: ']', Semicolon: ';', Quote: "'",
+  Comma: ',', Period: '.', Slash: '/', Backquote: '`',
+  Minus: '-', Equal: '=', Backslash: '\\',
+};
+
+export function matchesBinding(e: KeyboardEvent, binding: ShortcutBinding): boolean {
   // Case-insensitive compare for single-letter keys: Shift uppercases e.key on Windows,
   // but bindings are stored lowercase. Without toLowerCase, Ctrl+Shift+letter combos
   // never match (e.g. Ctrl+Shift+N fires with e.key='N' vs binding.key='n').
   const eventKey = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const bindingKey = binding.key.length === 1 ? binding.key.toLowerCase() : binding.key;
-  const keyMatch = eventKey === bindingKey;
+  // toLowerCase covers Shift on a LETTER ('N' -> 'n'). It does nothing for
+  // punctuation, where Shift produces a different character entirely: Ctrl+
+  // Shift+] arrives as e.key '}' while DEFAULT_SHORTCUTS stores ']', so
+  // nextSurface/prevSurface could never fire. Fall back to the physical key,
+  // the same way isLetterKey does in ./terminal-keys — e.code is stable under
+  // Shift, so BracketRight identifies ']' whether it produced ']' or '}'.
+  const keyMatch = eventKey === bindingKey
+    || (e.shiftKey && bindingKey.length === 1 && UNSHIFTED_BY_CODE[e.code] === bindingKey);
   const ctrlMatch = !!binding.ctrl === e.ctrlKey;
   const shiftMatch = !!binding.shift === e.shiftKey;
   const altMatch = !!binding.alt === e.altKey;
   return keyMatch && ctrlMatch && shiftMatch && altMatch;
-}
-
-/**
- * Keys that are safe to intercept even when a terminal has focus.
- * All others with only Ctrl held (no Shift/Alt) are forwarded to the terminal.
- */
-const SAFE_CTRL_KEYS = new Set(['b', 'd', 'n', 't', 'w', 'f', ',']);
-
-function isSafeToIntercept(e: KeyboardEvent): boolean {
-  if (!e.ctrlKey) return true; // Not a Ctrl combo — always safe
-
-  // Ctrl+Shift+* and Ctrl+Alt+* are safe (terminal uses bare Ctrl combos)
-  if (e.shiftKey || e.altKey) return true;
-
-  // Ctrl+PageDown / Ctrl+PageUp are safe
-  if (e.key === 'PageDown' || e.key === 'PageUp') return true;
-
-  // Ctrl+F2 is safe (rename)
-  if (e.key === 'F2') return true;
-
-  // Ctrl+F12 is safe (dev tools)
-  if (e.key === 'F12') return true;
-
-  // Ctrl+= / Ctrl+- / Ctrl+0 are safe (font size)
-  if (e.key === '=' || e.key === '-' || e.key === '0') return true;
-
-  // Specifically whitelisted bare Ctrl keys
-  if (SAFE_CTRL_KEYS.has(e.key.toLowerCase())) return true;
-
-  return false;
 }
 
 // ─── Spatial pane navigation ─────────────────────────────────────────────────
@@ -133,13 +133,15 @@ export function useKeyboardShortcuts(
   onToggleNotifications?: () => void,
   onFocusPane?: (paneId: PaneId) => void,
   onToggleZoom?: () => void,
+  onToggleExplorer?: () => void,
 ): void {
   const {
     shortcuts,
+    keyboardPrefs,
     workspaces,
     activeWorkspaceId,
     createWorkspace,
-    closeWorkspace,
+    requestCloseWorkspace,
     selectWorkspace,
     updateSplitTree,
     toggleSidebar,
@@ -147,7 +149,9 @@ export function useKeyboardShortcuts(
     nextSurface,
     prevSurface,
     closeSurface,
+    requestCloseSurface,
   } = useStore();
+  const t = useT();
 
   useEffect(() => {
     // ── Shared action helpers (kept small so each stays well under Sonar's
@@ -194,8 +198,9 @@ export function useKeyboardShortcuts(
       const leaf = findLeaf(ws.splitTree, focusedPaneId);
       const activeSurface = leaf?.surfaces[leaf.activeSurfaceIndex];
       if (activeSurface) {
-        // Close the active surface; if it's the last, closeSurface removes the pane.
-        closeSurface(activeWorkspaceId, focusedPaneId, activeSurface.id);
+        // Close the active surface; if it's the last, closeSurface removes the
+        // pane. Via requestCloseSurface so unsaved markdown edits confirm first.
+        requestCloseSurface(activeWorkspaceId, focusedPaneId, activeSurface.id);
         return;
       }
       // Fallback: no surfaces — remove the pane directly (guard: keep last pane).
@@ -222,9 +227,36 @@ export function useKeyboardShortcuts(
       state.markRead(unread.surfaceId);
     };
 
+    /**
+     * Go to the agent that has been waiting longest — and on a second press, to
+     * the next one.
+     *
+     * Cycling matters more than it looks: with three blocked agents, a jump
+     * that always lands on the same one is useless the moment you answer it,
+     * because the answer does NOT clear `blocked` (the agent must confirm), so
+     * the pane you just dealt with stays top of the queue for a beat and eats
+     * every further press. Skipping past the pane already focused sidesteps
+     * that without wmux having to guess whether the answer took.
+     */
+    const jumpToBlocked = () => {
+      const state = useStore.getState();
+      const { blocked } = rollupAgents(state.workspaces, state.agentStates, Date.now(), state.agentIdentities, state.agentDetections);
+      if (blocked.length === 0) return;
+
+      const currentIdx = blocked.findIndex((e) => e.paneId === focusedPaneId);
+      const next = blocked[(currentIdx + 1) % blocked.length];
+      const paneId = focusAgentTarget(
+        { workspaces: state.workspaces, selectWorkspace: state.selectWorkspace, selectSurface: state.selectSurface },
+        next,
+      );
+      if (paneId) onFocusPane?.(paneId);
+    };
+
     const copySelection = () => {
+      // Same line-end trim as the terminal Ctrl+C path (issue #102) — DOM
+      // selections over xterm rows carry the same ConPTY padding spaces.
       const selection = window.getSelection()?.toString();
-      if (selection) navigator.clipboard.writeText(selection);
+      if (selection) navigator.clipboard.writeText(trimTrailingWhitespace(selection));
     };
 
     const pasteIntoFocusedTerminal = () => {
@@ -238,6 +270,36 @@ export function useKeyboardShortcuts(
       if (activeSurf?.type === 'terminal') {
         document.dispatchEvent(new CustomEvent('wmux:paste-terminal', { detail: { surfaceId: activeSurf.id } }));
       }
+    };
+
+    // Force the focused terminal back into a usable state (issue #175). Same
+    // delegation shape as paste, and for the same reason: the fix belongs to
+    // the xterm instance, which only useTerminal holds a reference to.
+    const resetFocusedTerminal = () => {
+      if (!focusedPaneId || !activeWorkspaceId) return;
+      const ws = activeWs();
+      const leaf = ws ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+      const activeSurf = leaf?.surfaces[leaf.activeSurfaceIndex];
+      if (activeSurf?.type === 'terminal') {
+        document.dispatchEvent(new CustomEvent('wmux:reset-terminal', { detail: { surfaceId: activeSurf.id } }));
+      }
+    };
+
+    /**
+     * The terminal surface the user is looking at, or null.
+     *
+     * The prompt-log actions below act on the store and on the xterm instance
+     * directly rather than through a CustomEvent like paste/reset do: what they
+     * change is per-SURFACE state the store already owns, so there is nothing
+     * that only the mounted component could do. Only `followOutput` needs the
+     * emulator, and the registry hands it over without a round trip.
+     */
+    const focusedTerminalSurfaceId = (): string | null => {
+      if (!focusedPaneId || !activeWorkspaceId) return null;
+      const ws = activeWs();
+      const leaf = ws ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+      const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+      return surface?.type === 'terminal' ? surface.id : null;
     };
 
     const adjustFontSize = (next: (size: number) => number) => {
@@ -279,9 +341,11 @@ export function useKeyboardShortcuts(
     //    new actions just add an entry. `find`/`copyMode` are handled at the
     //    PaneWrapper level and short-circuited before this lookup. ─────────────
     const handlers: Partial<Record<ShortcutAction, () => void>> = {
-      newWorkspace: () => createWorkspace(),
+      newWorkspace: () => createWorkspace(undefined, t),
       newWindow: () => window.wmux?.window?.create?.(),
-      closeWorkspace: () => { if (activeWorkspaceId) closeWorkspace(activeWorkspaceId); },
+      // Routed through the close guard (issue #90): prompts when the opt-in
+      // confirmWorkspaceClose pref is on, closes immediately otherwise.
+      closeWorkspace: () => { if (activeWorkspaceId) requestCloseWorkspace(activeWorkspaceId); },
       closeWindow: () => window.close(),
       openFolder: openFolderAsWorkspace,
       toggleSidebar: () => toggleSidebar(),
@@ -303,6 +367,10 @@ export function useKeyboardShortcuts(
       nextSurface: () => { if (activeWorkspaceId && focusedPaneId) nextSurface(activeWorkspaceId, focusedPaneId); },
       prevSurface: () => { if (activeWorkspaceId && focusedPaneId) prevSurface(activeWorkspaceId, focusedPaneId); },
       jumpToUnread,
+      jumpToBlocked,
+      openAgentNavigator: () => fire('wmux:open-agent-navigator'),
+      // Easter egg: inert until enabled in Settings → General.
+      openHub: () => { if (useStore.getState().appearancePrefs.hubEnabled) fire('wmux:open-hub'); },
       showNotifications: () => onToggleNotifications?.(),
       flashFocused: () => { if (focusedPaneId) fire('wmux:trigger-flash', { paneId: focusedPaneId }); },
       openBrowser: () => onToggleBrowser?.(),
@@ -310,11 +378,36 @@ export function useKeyboardShortcuts(
       browserConsole: () => window.wmux?.system?.toggleDevTools?.(),
       copy: copySelection,
       paste: pasteIntoFocusedTerminal,
+      resetTerminal: resetFocusedTerminal,
+      // Issue #207. The bodies live in store/prompt-actions.ts so the command
+      // palette runs the same code — see the note there.
+      // The pane context is what lets `outlineMode: 'pane'` put the outline in
+      // the split tree instead of over the terminal; without it the action
+      // silently falls back to the overlay.
+      togglePromptOutline: () => togglePromptOutlineFor(
+        focusedTerminalSurfaceId(),
+        activeWorkspaceId && focusedPaneId ? { workspaceId: activeWorkspaceId, paneId: focusedPaneId } : null,
+      ),
+      togglePinnedPrompt: () => togglePinnedPromptFor(focusedTerminalSurfaceId()),
+      followOutput: () => followOutputFor(focusedTerminalSurfaceId()),
       fontSizeIncrease: () => adjustFontSize((s) => Math.min(32, s + 1)),
       fontSizeDecrease: () => adjustFontSize((s) => Math.max(8, s - 1)),
       fontSizeReset: () => useStore.getState().setTerminalPrefs({ fontSize: 13 }),
       openSettings: () => onOpenSettings?.(true),
       openMarkdownPanel: () => { if (activeWorkspaceId && focusedPaneId) addSurface(activeWorkspaceId, focusedPaneId, 'markdown'); },
+      // Focus-or-create: the diff panel is a singleton view of the working tree,
+      // so if the focused pane already has a diff tab, jump to it rather than
+      // stacking a duplicate (the auto-open hook in App.tsx dedups the same way).
+      openDiffPanel: () => {
+        if (!activeWorkspaceId || !focusedPaneId) return;
+        const st = useStore.getState();
+        const ws = st.workspaces.find((w) => w.id === activeWorkspaceId);
+        const leaf = ws && findLeaf(ws.splitTree, focusedPaneId);
+        const existingIdx = leaf ? leaf.surfaces.findIndex((s) => s.type === 'diff') : -1;
+        if (leaf && existingIdx >= 0) st.selectSurface(activeWorkspaceId, focusedPaneId, existingIdx);
+        else st.addSurface(activeWorkspaceId, focusedPaneId, 'diff');
+      },
+      toggleExplorer: () => onToggleExplorer?.(),
       // commandPalette is opened by App.tsx's own listener; keep a no-op so we
       // still preventDefault on the combo. find/copyMode are short-circuited above.
       commandPalette: () => {},
@@ -330,15 +423,36 @@ export function useKeyboardShortcuts(
       togglePinWorkspace,
       markWorkspaceRead,
       toggleShortcutCheatSheet: () => fire('wmux:toggle-cheatsheet'),
+      // ── issue #116 ───────────────────────────────────────────────────────
+      // View mode lives on the SurfaceRef, so this flips store state directly
+      // rather than going through a CustomEvent. A no-op unless the focused
+      // pane's *active* surface is markdown — toggling a background tab the
+      // user can't see would be invisible and confusing.
+      toggleMarkdownSource: () => {
+        if (!activeWorkspaceId || !focusedPaneId) return;
+        const st = useStore.getState();
+        const ws = st.workspaces.find((w) => w.id === activeWorkspaceId);
+        const leaf = ws && findLeaf(ws.splitTree, focusedPaneId);
+        const surface = leaf?.surfaces[leaf.activeSurfaceIndex];
+        if (!surface || surface.type !== 'markdown') return;
+        st.updateSurface(activeWorkspaceId, focusedPaneId, surface.id, {
+          markdownViewMode: surface.markdownViewMode === 'source' ? 'preview' : 'source',
+        });
+      },
     };
 
     function handleKeyDown(e: KeyboardEvent): void {
       if (!isSafeToIntercept(e)) return;
 
+      const inEditor = isEditableTarget(e.target as HTMLElement | null);
       const shortcutEntries = Object.entries(shortcuts) as [ShortcutAction, ShortcutBinding][];
 
       for (const [action, binding] of shortcutEntries) {
         if (!matchesBinding(e, binding)) continue;
+
+        // Typing in a text field wins over all but a few global actions, and we
+        // must return *without* preventDefault so the field still gets the key.
+        if (inEditor && !GLOBAL_IN_EDITOR.has(action)) return;
 
         // find and copyMode are handled at PaneWrapper level — don't block them
         if (action === 'find' || action === 'copyMode') return;
@@ -363,7 +477,7 @@ export function useKeyboardShortcuts(
     activeWorkspaceId,
     focusedPaneId,
     createWorkspace,
-    closeWorkspace,
+    requestCloseWorkspace,
     selectWorkspace,
     updateSplitTree,
     toggleSidebar,
@@ -376,43 +490,53 @@ export function useKeyboardShortcuts(
     onToggleNotifications,
     onFocusPane,
     onToggleZoom,
+    onToggleExplorer,
+    t,
   ]);
 
-  // Ctrl+1 through Ctrl+9 — select workspace by index
+  // ── Numeric index shortcuts — select workspace N / tab N (issue #202) ───────
+  // One listener for both families, not two. They compete for the same digit
+  // row, and `reconcileIndexModifiers` guarantees they never hold the same
+  // modifiers — but only a single handler can *also* guarantee that a matched
+  // digit is consumed once, whichever family claimed it.
+  //
+  // Which modifiers each family answers to now comes from `keyboardPrefs`, so
+  // both are rebindable, swappable and switchable off in Settings. The defaults
+  // are the old hardcoded Ctrl+1–9 / Ctrl+Alt+1–9.
   useEffect(() => {
-    function handleWorkspaceIndexKey(e: KeyboardEvent): void {
-      if (!e.ctrlKey || e.shiftKey || e.altKey) return;
-      const digit = parseInt(e.key, 10);
-      if (isNaN(digit) || digit < 1 || digit > 9) return;
-
-      e.preventDefault();
-      const target = workspaces[digit - 1];
-      if (target) selectWorkspace(target.id);
-    }
-
-    document.addEventListener('keydown', handleWorkspaceIndexKey);
-    return () => {
-      document.removeEventListener('keydown', handleWorkspaceIndexKey);
+    const selectWorkspaceByIndex = (digit: number): void => {
+      const idx = resolveIndexTarget(digit, workspaces.length);
+      if (idx !== null) selectWorkspace(workspaces[idx].id);
     };
-  }, [workspaces, selectWorkspace]);
 
-  // Ctrl+Alt+1 through Ctrl+Alt+9 — select tab (surface) N in the focused pane
-  // (issue #64). Mirrors the Ctrl+1–9 workspace selector above; kept as a fixed
-  // handler rather than nine remappable entries to avoid bloating Settings.
-  useEffect(() => {
-    function handleSurfaceIndexKey(e: KeyboardEvent): void {
-      if (!e.ctrlKey || !e.altKey || e.shiftKey) return;
-      const digit = parseInt(e.key, 10);
-      if (isNaN(digit) || digit < 1 || digit > 9) return;
+    const selectSurfaceByIndex = (digit: number): void => {
       if (!activeWorkspaceId || !focusedPaneId) return;
+      const state = useStore.getState();
+      const ws = state.workspaces.find((w) => w.id === activeWorkspaceId);
+      const leaf = ws ? findLeaf(ws.splitTree, focusedPaneId) : undefined;
+      // Tab count is read live rather than from a dep — a pane's surfaces
+      // change far more often than the pane itself, and re-registering the
+      // listener on every tab open would be pure churn.
+      const idx = resolveIndexTarget(digit, leaf?.surfaces.length ?? 0);
+      if (idx !== null) state.selectSurface(activeWorkspaceId, focusedPaneId, idx);
+    };
 
+    function handleIndexKey(e: KeyboardEvent): void {
+      const wsDigit = matchIndexShortcut(e, keyboardPrefs.workspaceIndexModifiers);
+      const surfDigit = wsDigit === null ? matchIndexShortcut(e, keyboardPrefs.surfaceIndexModifiers) : null;
+      if (wsDigit === null && surfDigit === null) return;
+
+      // preventDefault unconditionally once a family claims the combo: the
+      // digit must not also reach the terminal just because the target index
+      // happens to be empty right now. Only 'off' lets a digit through.
       e.preventDefault();
-      useStore.getState().selectSurface(activeWorkspaceId, focusedPaneId, digit - 1);
+      if (wsDigit !== null) selectWorkspaceByIndex(wsDigit);
+      else if (surfDigit !== null) selectSurfaceByIndex(surfDigit);
     }
 
-    document.addEventListener('keydown', handleSurfaceIndexKey);
+    document.addEventListener('keydown', handleIndexKey);
     return () => {
-      document.removeEventListener('keydown', handleSurfaceIndexKey);
+      document.removeEventListener('keydown', handleIndexKey);
     };
-  }, [activeWorkspaceId, focusedPaneId]);
+  }, [workspaces, selectWorkspace, activeWorkspaceId, focusedPaneId, keyboardPrefs]);
 }

@@ -1,27 +1,494 @@
 import { ipcMain, BrowserWindow, clipboard, shell, dialog, app, nativeTheme } from 'electron';
-import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId } from '../shared/types';
-import { observePtyData } from './claude-observer';
+import { promises as fsp } from 'fs';
+import { IPC_CHANNELS, SurfaceId, WindowId, WorkspaceId, AgentId, type InsertionResult, type ExplorerListError } from '../shared/types';
+import { observePtyData, clearActivity } from './claude-observer';
+import { createPtyDataBatcher } from './pty-data-batcher';
+import { clearAgentState, noteHumanInput, listAgentStates } from './agent-state';
 import { PtyManager } from './pty-manager';
+import { PtyLedger, reapOrphans } from './pty-ledger';
+import { SshDetector } from './ssh-detect';
+import { agentIdentity } from './agent-identity';
+import { setDetection, forgetDetection, activeManifests } from './detection-store';
+import {
+  readClipboardSource,
+  regularFilePaths,
+  resolveInsertion,
+  SurfaceInsertionQueue,
+  uploadEnabled,
+  type PasteSource,
+} from './remote-insert';
+import { getAppDataDir } from '../shared/instance';
 import { NotificationManager } from './notification-manager';
 import { detectShells } from './shell-detector';
+import { listSystemFonts } from './font-detector';
+import { isContextMenuInstalled, installContextMenu, uninstallContextMenu } from './shell-context-menu';
 import { getDefaultTheme, getThemeByName, loadBundledThemes } from './theme-loader';
 import { parseWindowsTerminalConfig, parseGhosttyConfig, loadProjectProfiles, importWindowsTerminalProfiles } from './config-loader';
-import { loadUserConfig, getConfigPath } from './user-config';
-import { WindowManager } from './window-manager';
+import { loadUserConfig, getConfigPath, resetConfigWarnings } from './user-config';
+import { loadUserLocales } from './user-locales';
+import { WindowManager, supportsBackdropMaterial, supportsTransparency, toWindowMaterial } from './window-manager';
+import { refreshShellIconCache, takeIconChangeNotice } from './icon-cache';
 import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
 import { AgentManager } from './agent-manager';
 import { saveNamedSession, loadNamedSession, listNamedSessions, deleteNamedSession, loadSession } from './session-persistence';
+import { listDir, resolveInRoot, isExecutablePath } from './explorer-fs';
+import { readCodeFile, writeCodeFile } from './code-file';
+import { getExplorerRoot, forgetExplorerRoot } from './explorer-roots';
+import { sessionWindows, toRestorePayload, restoreAnswerFor } from './session-windows';
 import { loadSettings, saveSetting } from './settings-store';
-import { getChangedFiles, getFileDiff } from './diff-provider';
+import { readConsent, updateConsent } from './agent-integration';
+import { handleAgentStateV2 } from './agent-state-rpc';
+import { getChangedFiles, getFileDiff, getChangedFilesWithBaseline } from './diff-provider';
+import {
+  readMarkdownFile,
+  isAllowedMarkdownPath,
+  statMarkdownFile,
+  writeMarkdownFile,
+  MD_DIALOG_EXTENSIONS,
+} from './markdown-file';
+import { grantFilePath, isFilePathGranted } from './file-grants';
+import { agentBrowserPath, runAgentBrowser, unwrapAgentData, type RunResult } from './agent-browser-cli';
+// The process-wide singletons. Constructing a second SessionRegistry or
+// DashboardDaemon here would hand the same stream port to two surfaces and let
+// either daemon stop the dashboard out from under the other — see the header of
+// agent-browser-runtime.ts.
+import {
+  acquireDashboardFor,
+  agentBrowserTeardownDeps,
+  closeSessionFor,
+  dashboardDaemon,
+  ensureBindableSession,
+  releaseDashboardFor,
+  sessionRegistry,
+} from './agent-browser-runtime';
+import type { AgentSession } from './agent-browser-session';
 
-const ptyManager = new PtyManager();
+// Claimed at module load, before anything can spawn a PTY, so the candidate
+// list is strictly what a PREVIOUS instance left behind (issue #139). The
+// killing half is async and driven from index.ts once the app is up.
+const ptyLedger = new PtyLedger(path.join(getAppDataDir(), 'pty-ledger.json'));
+const orphanCandidates = ptyLedger.takeOver();
+
+const ptyManager = new PtyManager(ptyLedger);
 const notificationManager = new NotificationManager();
 const cdpBridge = new CDPBridge();
 const agentManager = new AgentManager(ptyManager);
+const insertionQueue = new SurfaceInsertionQueue();
+const surfaceOwners = new Map<SurfaceId, number>();
+const observedWebContents = new Set<number>();
+
+function ownSurface(surfaceId: SurfaceId, webContents: Electron.WebContents): void {
+  surfaceOwners.set(surfaceId, webContents.id);
+  if (observedWebContents.has(webContents.id)) return;
+  observedWebContents.add(webContents.id);
+  webContents.once('destroyed', () => {
+    observedWebContents.delete(webContents.id);
+    for (const [ownedSurfaceId, ownerId] of surfaceOwners) {
+      if (ownerId !== webContents.id) continue;
+      surfaceOwners.delete(ownedSurfaceId);
+      insertionQueue.cancel(ownedSurfaceId);
+    }
+  });
+}
+
+/**
+ * Close this surface's agent-browser session, if it has one. Fire-and-forget.
+ *
+ * Every caller is a teardown path — a PTY exiting, a pane closing, a renderer
+ * being destroyed — so this must never throw into one and must never make one
+ * wait. `closeSessionFor` drops the registry entry before it spawns anything,
+ * so calling this twice for one surface closes once.
+ *
+ * A session is a real Chrome. Sessions are ephemeral by design (see
+ * agent-browser-session.ts), which is exactly what makes NOT closing one here a
+ * leak rather than a cache: nothing will ever legitimately reattach to it, and
+ * on Windows it does not die with wmux either (issue #139).
+ */
+export function closeAgentBrowserSession(surfaceId: SurfaceId): void {
+  closeSessionFor(surfaceId, agentBrowserTeardownDeps).catch(() => {
+    /* teardown is best-effort by construction; see closeSessionByName */
+  });
+}
+
+function forgetSurface(surfaceId: SurfaceId): void {
+  surfaceOwners.delete(surfaceId);
+  insertionQueue.cancel(surfaceId);
+  sshDetector.forget(surfaceId);
+  forgetExplorerRoot(surfaceId);
+  agentIdentity.forget(surfaceId);
+  forgetDetection(surfaceId);
+  // Same teardown moment, same reasoning as clearing the ssh/agent state above:
+  // whatever this surface owned outside the renderer is now unreachable.
+  closeAgentBrowserSession(surfaceId);
+}
+
+/**
+ * Surfaces with a live agent session, and which renderer they belong to.
+ *
+ * Browser surfaces never reach `ownSurface` — that is the PTY create path — so
+ * without this a window closed while a pane sat in agent mode leaks its Chrome:
+ * the renderer is killed outright, and `BrowserPane`'s unmount effect (the
+ * renderer-side `disable`) does not get to run. `webContents 'destroyed'` is
+ * the only teardown signal main receives for that case.
+ */
+const agentBrowserOwners = new Map<SurfaceId, number>();
+const observedAgentWebContents = new Set<number>();
+
+function ownAgentBrowserSurface(surfaceId: SurfaceId, webContents: Electron.WebContents): void {
+  agentBrowserOwners.set(surfaceId, webContents.id);
+  if (observedAgentWebContents.has(webContents.id)) return;
+  observedAgentWebContents.add(webContents.id);
+  webContents.once('destroyed', () => {
+    observedAgentWebContents.delete(webContents.id);
+    for (const [ownedSurfaceId, ownerId] of agentBrowserOwners) {
+      if (ownerId !== webContents.id) continue;
+      agentBrowserOwners.delete(ownedSurfaceId);
+      closeAgentBrowserSession(ownedSurfaceId);
+    }
+  });
+}
+
+function ownsLiveSurface(surfaceId: unknown, webContents: Electron.WebContents): surfaceId is SurfaceId {
+  return typeof surfaceId === 'string'
+    && ptyManager.has(surfaceId as SurfaceId)
+    && surfaceOwners.get(surfaceId as SurfaceId) === webContents.id;
+}
+
+/**
+ * Tracks which panes are sitting inside an ssh session, so a pasted image or a
+ * dropped file can be scp'd to the host the pane is actually on instead of
+ * having a local Windows path typed into a remote shell that cannot open it.
+ *
+ * Module-scoped alongside ptyManager because the surface -> pid mapping it
+ * needs lives there. Exported the same way ptyManager and agentManager are,
+ * so index.ts can feed it the shell-integration reports directly.
+ */
+export const sshDetector = new SshDetector(
+  {
+    getPid: (surfaceId) => ptyManager.getPid(surfaceId as SurfaceId),
+    liveSurfaceIds: () => ptyManager.liveSurfaceIds(),
+  },
+  undefined,
+  // The sweep's other half. One ~550ms PowerShell spawn now answers both "is
+  // this pane in ssh?" and "what agent is this pane running?" — the process
+  // table already carried every row's name and was throwing all but ssh.exe away.
+  (found, liveSurfaceIds) => agentIdentity.applyProbe(found, liveSurfaceIds),
+);
+
+/**
+ * Which agent, if any, each surface is running.
+ *
+ * Fed from the same two report paths as sshDetector, and for the same reason:
+ * Windows has no tty foreground process group, so the authoritative answer has
+ * to come from what wmux launched or what the shell hook says was submitted.
+ *
+ * Re-exported rather than constructed here — see the note on the singleton in
+ * agent-identity.ts for why it cannot live in this module.
+ */
+export { agentIdentity };
+
+
+
+/**
+ * Tree-kill the PTY subtrees a previously crashed wmux left running (issue
+ * #139). Best-effort and unawaited by design — see reapOrphans().
+ */
+export function reapOrphanedPtys(): void {
+  reapOrphans(orphanCandidates).then(
+    () => { /* reaped, or nothing to reap */ },
+    (err) => { console.warn('[wmux] orphan reap failed:', err?.message); },
+  );
+}
+
+// ─── agent-browser engine control ──────────────────────────────────────────
+//
+// Flipping one browser surface between the `web` <webview> and the `agent`
+// engine. The renderer owns the decision (it is a per-surface toggle in the
+// pane) but owns none of the machinery: the binary, the session registry and
+// the dashboard refcount all live here.
+//
+// Everything below the argv builders is dependency-INJECTED rather than reading
+// the module singletons directly, for the same reason `agent-browser-verbs.ts`
+// is pure: the sequencing (acquire, ensure, open, bind stream / read-back,
+// close, release) is the part most likely to be wrong, and it must be testable
+// with no Chrome, no dashboard and no ports.
+
+/**
+ * Open the session's pinned tab, optionally at `currentUrl`.
+ *
+ * `--pin-tab` binds the session to its own CDP target. Without it a second
+ * pane's session can attach to the tab this one is driving, and two agents
+ * silently share one page.
+ *
+ * `about:blank` is dropped rather than passed through: it is what a browser
+ * surface reports when it has never navigated anywhere, and handing it to
+ * agent-browser would spend a page load arriving at the same nothing.
+ */
+export function agentBrowserOpenArgv(sessionName: string, currentUrl?: string): string[] {
+  const target = currentUrl && currentUrl !== 'about:blank' ? [currentUrl] : [];
+  return ['--session', sessionName, '--pin-tab', 'open', ...target];
+}
+
+/**
+ * The environment that pins a session's stream to the port wmux allocated.
+ *
+ * Load-bearing for the pane, not optional telemetry: the dashboard deep-link in
+ * `AgentSession.dashboardUrl` is `?port=<streamPort>`, so a session streaming
+ * anywhere else renders an empty dashboard.
+ *
+ * This has to be an ENV VAR on the launching `open`, and there is no second
+ * option. Streaming is already enabled by the time a session opens, on an
+ * OS-assigned port, so the obvious `stream enable --port` is rejected outright
+ * — measured against 0.35.0:
+ *
+ *     stream enable --port 9300 → exit 1, "✗ Streaming is already enabled"
+ *     stream status             → "Streaming enabled on ws://127.0.0.1:61379"
+ *
+ * whereas launching the session with the documented variable set gives
+ * "Streaming enabled on ws://127.0.0.1:9300, Connected: true", and the
+ * dashboard's own /api/sessions then reports `{"port":9300,...}` for it. The
+ * variable is only read when the session's browser is LAUNCHED, which is why it
+ * belongs on the `open` call and not on any later invocation.
+ */
+export function agentBrowserStreamEnv(streamPort: number): NodeJS.ProcessEnv {
+  return { AGENT_BROWSER_STREAM_PORT: String(streamPort) };
+}
+
+/** Read the page back before closing, so flipping to `web` lands where the agent was. */
+export function agentBrowserGetUrlArgv(sessionName: string): string[] {
+  return ['--session', sessionName, 'get', 'url'];
+}
+
+export function agentBrowserCloseArgv(sessionName: string): string[] {
+  return ['--session', sessionName, 'close'];
+}
+
+/**
+ * Schemes the read-back url may carry into the webview.
+ *
+ * This value comes from whatever page the agent navigated to, and its only
+ * consumer sets it as a `<webview>` src — so `javascript:` (and `data:`) would
+ * be script execution inside the pane chrome, sourced from a page nobody
+ * audited. Anything unrecognised is dropped and the pane falls back to its own
+ * default, which is a worse handoff but never an exploit.
+ */
+const READBACK_SCHEMES = /^(https?|file|about):/i;
+
+/**
+ * The url from a `get url` invocation, or undefined.
+ *
+ * Reads through `unwrapAgentData` rather than off `res.data` directly. The argv
+ * wmux sends carries no `--json`, so what arrives today is the bare line
+ * `https://example.com/` and stdout is the whole answer — but with `--json` the
+ * url sits at `data.url` INSIDE a `{success, data, error}` envelope, where a
+ * direct `res.data.url` finds nothing and the stdout fallback then hands the
+ * scheme test an entire JSON blob. Unwrapping first makes both forms work, so
+ * adding `--json` later cannot silently break the web handoff.
+ */
+export function readBackUrl(res: RunResult): string | undefined {
+  if (!res.ok) return undefined;
+  const payload = unwrapAgentData(res) as { url?: unknown } | null;
+  const raw = (typeof payload?.url === 'string' ? payload.url : res.stdout).trim();
+  return raw && READBACK_SCHEMES.test(raw) ? raw : undefined;
+}
+
+export interface AgentBrowserEnableResult {
+  installed: boolean;
+  dashboardUrl?: string;
+  sessionName?: string;
+}
+
+export interface AgentBrowserDisableResult {
+  url?: string;
+}
+
+/**
+ * Everything enable/disable touch that is not pure.
+ *
+ * `acquireDashboard`/`releaseDashboard` take a surfaceId because the daemon is
+ * refcounted per LIVE AGENT-MODE SURFACE, and the renderer may legitimately
+ * call enable twice for one pane (a re-enable, a remount) or disable a pane
+ * that was never enabled. Making the pair surface-scoped is what keeps the
+ * refcount balanced regardless.
+ */
+export interface AgentBrowserDeps {
+  binary: () => string | null;
+  run: (binary: string, argv: string[], env?: NodeJS.ProcessEnv) => Promise<RunResult>;
+  acquireDashboard: (surfaceId: SurfaceId) => Promise<void>;
+  releaseDashboard: (surfaceId: SurfaceId) => Promise<void>;
+  /**
+   * Awaited, because the real one is async: it probes the stream port before
+   * committing to it (`SessionRegistry.ensureBindable`). A synchronous stub is
+   * still a valid implementation, which is what keeps the tests port-free.
+   */
+  ensureSession: (surfaceId: SurfaceId) => AgentSession | Promise<AgentSession>;
+  getSession: (surfaceId: SurfaceId) => AgentSession | undefined;
+  releaseSession: (surfaceId: SurfaceId) => AgentSession | undefined;
+}
+
+/**
+ * Schemes `agentBrowserOpen` will put on a command line.
+ *
+ * Deliberately the same set `READBACK_SCHEMES` accepts, so a URL read back out
+ * of a session can always be handed straight back to it. The check is a
+ * boundary, not politeness: this value arrives from the renderer and becomes a
+ * positional argument to agent-browser, so anything not anchored to a known
+ * scheme — a bare `--flag`, a `-x`, an empty string — would be parsed as part
+ * of the command rather than as a target.
+ */
+const OPEN_SCHEMES = /^(https?|file|about):/i;
+
+/**
+ * Where the session's Chrome actually is right now.
+ *
+ * The pane cannot answer this itself: in agent mode its webview shows the
+ * dashboard, while the page lives in a Chrome outside wmux that the AGENT
+ * drives. Without this the address bar can only show the last URL the pane
+ * asked for, which stops being true the moment the agent clicks a link.
+ *
+ * Every failure answers `{}` rather than throwing. This is polled, and a
+ * transient CLI failure must degrade to "the bar keeps its last value", not to
+ * a rejected IPC call once every few seconds.
+ */
+export async function agentBrowserCurrentUrl(
+  surfaceId: SurfaceId,
+  deps: AgentBrowserDeps,
+): Promise<{ url?: string }> {
+  // No session ⇒ the surface is not in agent mode (or never got that far).
+  // Deliberately `getSession`, never `ensureSession`: a read must not create.
+  const session = deps.getSession(surfaceId);
+  if (!session) return {};
+  const binary = deps.binary();
+  if (!binary) return {};
+  try {
+    const url = readBackUrl(await deps.run(binary, agentBrowserGetUrlArgv(session.sessionName)));
+    return url ? { url } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Navigate the session. The address bar's Enter key, in agent mode.
+ *
+ * Separate from `enableAgentBrowser` because the pane used to reuse `enable`
+ * for this, and `enable` does two things navigation does not need: it acquires
+ * a dashboard reference and it relaunches the open with the stream env. Neither
+ * has any effect on a session that is already live (the stream port is read at
+ * browser LAUNCH and cannot move afterwards — see `agentBrowserStreamEnv`), so
+ * both were pure cost on every keystroke-committed URL.
+ *
+ * Requires an EXISTING session: "navigate" is meaningless for a surface that is
+ * not in agent mode, and creating one here would let a stray renderer call
+ * start a Chrome for a pane the user never flipped.
+ */
+export async function agentBrowserOpen(
+  surfaceId: SurfaceId,
+  url: string,
+  deps: AgentBrowserDeps,
+): Promise<{ ok: boolean }> {
+  const session = deps.getSession(surfaceId);
+  if (!session) return { ok: false };
+  if (typeof url !== 'string' || !OPEN_SCHEMES.test(url)) return { ok: false };
+  const binary = deps.binary();
+  if (!binary) return { ok: false };
+  try {
+    const res = await deps.run(binary, agentBrowserOpenArgv(session.sessionName, url));
+    return { ok: res.ok };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function enableAgentBrowser(
+  surfaceId: SurfaceId,
+  currentUrl: string | undefined,
+  deps: AgentBrowserDeps,
+): Promise<AgentBrowserEnableResult> {
+  const binary = deps.binary();
+  // Not an error: the renderer answers a missing binary with the setup card,
+  // and throwing here would turn an offer to install into a broken pane.
+  if (!binary) return { installed: false };
+
+  try {
+    await deps.acquireDashboard(surfaceId);
+  } catch (err) {
+    // The dashboard is OBSERVABILITY. agent-browser drives Chrome perfectly
+    // well without its viewer, so refusing to enable because the viewer did
+    // not start would trade a degraded feature for a broken one. Same call as
+    // v2-browser.ts's `agentTargetFor` makes, for the same reason.
+    console.warn('[wmux] agent-browser dashboard did not start:', (err as Error)?.message);
+  }
+
+  const session = await deps.ensureSession(surfaceId);
+  // ONE invocation, carrying the stream port in its environment. There is
+  // deliberately no follow-up `stream enable --port`: streaming is already on
+  // by the time this returns, so that call fails outright, and the port it
+  // would have tried to set is decided when the browser LAUNCHES — i.e. here.
+  // See `agentBrowserStreamEnv`.
+  await deps.run(
+    binary,
+    agentBrowserOpenArgv(session.sessionName, currentUrl),
+    agentBrowserStreamEnv(session.streamPort),
+  );
+  return { installed: true, dashboardUrl: session.dashboardUrl, sessionName: session.sessionName };
+}
+
+export async function disableAgentBrowser(
+  surfaceId: SurfaceId,
+  deps: AgentBrowserDeps,
+): Promise<AgentBrowserDisableResult> {
+  // Idempotent by design: the renderer calls this on unmount, which fires for
+  // panes that never entered agent mode at all. No session means there is
+  // nothing to close and — since `enableAgentBrowser` only ever acquires the
+  // dashboard on the path that also creates one — nothing to release either.
+  const session = deps.getSession(surfaceId);
+  if (!session) return {};
+
+  const binary = deps.binary();
+  let url: string | undefined;
+  if (binary) {
+    // Read BEFORE close; the page is gone afterwards. Failure here is
+    // tolerated rather than propagated: not knowing where the agent was is a
+    // worse handoff, but refusing to tear the session down over it would
+    // strand a Chrome and a dashboard reference for the rest of the session.
+    try {
+      url = readBackUrl(await deps.run(binary, agentBrowserGetUrlArgv(session.sessionName)));
+    } catch { /* see above */ }
+    try {
+      await deps.run(binary, agentBrowserCloseArgv(session.sessionName));
+    } catch { /* see above */ }
+  }
+
+  deps.releaseSession(surfaceId);
+  await deps.releaseDashboard(surfaceId);
+  return url ? { url } : {};
+}
+
+/**
+ * The real machine behind `AgentBrowserDeps`. Every production call uses this.
+ *
+ * The per-surface dashboard reference is NOT tracked here. It used to be, in a
+ * Set local to this module — but `v2-browser.ts` independently kept its own for
+ * the same surfaces, and a pane enabled from the UI and then driven by
+ * `wmux browser open` took two references and gave back one, so the dashboard
+ * outlived every agent pane. `acquireDashboardFor`/`releaseDashboardFor` own
+ * that bookkeeping for the whole process; both call paths go through them.
+ */
+const agentBrowserDeps: AgentBrowserDeps = {
+  binary: () => agentBrowserPath(),
+  run: (binary, argv, env) => runAgentBrowser(binary, argv, undefined, env),
+  acquireDashboard: (surfaceId) => acquireDashboardFor(surfaceId),
+  releaseDashboard: (surfaceId) => releaseDashboardFor(surfaceId),
+  // The bindable variant, not the bare `ensure()`. This is the one path that
+  // launches a browser with `AGENT_BROWSER_STREAM_PORT` set, so it is the one
+  // path where the port has to be a port the OS will actually let us have.
+  ensureSession: (surfaceId) => ensureBindableSession(surfaceId),
+  getSession: (surfaceId) => sessionRegistry.get(surfaceId),
+  releaseSession: (surfaceId) => sessionRegistry.release(surfaceId),
+};
 
 export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstance?: CDPProxy): void {
   // Toggle DevTools for the renderer window
@@ -44,6 +511,34 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       };
       const created = ptyManager.create(resolvedOptions);
       const id = created.id;
+      const existingOwner = surfaceOwners.get(id);
+      // StrictMode may repeat create from the same renderer, and a replacement
+      // window may reclaim a surface after the old webContents was destroyed.
+      // A different live renderer must not steal an existing surface merely by
+      // invoking idempotent PTY_CREATE with its id.
+      const acceptedOwner = !created.reused
+        || existingOwner === undefined
+        || existingOwner === _event.sender.id;
+      if (acceptedOwner) {
+        ownSurface(id, _event.sender);
+        // `wmux ssh user@host` puts the whole ssh command line in the REQUESTED
+        // shell spec, which is the one detection source that is authoritative
+        // rather than inferred.
+        //
+        // Deliberately `resolvedOptions.shell` and not `created.shell`: create()
+        // returns the resolved executable with the arguments split off into
+        // `shellExtraArgs`, so `created.shell` is a bare `…\ssh.exe` with no
+        // destination left in it — which parses to nothing at all.
+        // Keep this mutation behind the ownership decision: a different window
+        // can call idempotent PTY_CREATE with a known id, but must not rewrite
+        // where the legitimate owner's next file upload will go.
+        sshDetector.setSurfaceShell(id, resolvedOptions.shell, created.shell, resolvedOptions.cwd);
+        // Same spec, same reason: `wmux agent spawn --cmd claude` and
+        // `--shell "claude --resume"` put the agent's own command line here, so
+        // this pane IS that agent for as long as it lives. Pure string work —
+        // nothing added to the synchronous create path's budget (issue #176).
+        agentIdentity.setSurfaceShell(id, resolvedOptions.shell);
+      }
       // Reused PTY (idempotent create — e.g. StrictMode's double create() race):
       // the original create already wired data/exit forwarding. Re-wiring here
       // would forward every chunk twice and double everything in the renderer.
@@ -51,17 +546,38 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
         return created;
       }
       const window = BrowserWindow.fromWebContents(_event.sender);
-      const unsubData = ptyManager.onData(id, (data) => {
+      // Batch the per-chunk stream before it crosses IPC: one send per ~4ms
+      // window per pane instead of one per ConPTY chunk, which is what kept
+      // keystroke echo waiting behind other panes' output under load. The
+      // observer reads the same batched bytes — identical lines in identical
+      // order — so its ANSI-strip/regex pass drops to the same cadence.
+      const batcher = createPtyDataBatcher((data) => {
         if (window && !window.isDestroyed()) {
           window.webContents.send(IPC_CHANNELS.PTY_DATA, id, data);
         }
         // Feed Claude Code observer for sidebar activity display
         try { observePtyData(id, data); } catch {}
       });
+      const unsubData = ptyManager.onData(id, (data) => batcher.push(data));
       const unsubExit = ptyManager.onExit(id, (code) => {
+        // Trailing output must land before the exit notification, or the
+        // renderer paints the exit over bytes still sitting in the window.
+        batcher.flush();
+        batcher.dispose();
         if (window && !window.isDestroyed()) {
           window.webContents.send(IPC_CHANNELS.PTY_EXIT, id, code);
         }
+        // The process that owned this surface is gone, so any state it declared
+        // is now a lie. Drop it rather than leave a `working`/`blocked` pane
+        // pointing at a dead PID (issue #128); the observer's scraped activity
+        // goes with it, since it describes the same dead process.
+        clearAgentState(id);
+        clearActivity(id);
+        // Same reasoning for the remote session: the ssh that made this pane
+        // remote has exited (dropped connection, or the user typed `exit`), so
+        // a later paste must not still be offered an upload to that host.
+        // PTY_KILL covers the pane being closed; this covers it dying on its own.
+        forgetSurface(id);
         // Clean up listeners when PTY exits
         unsubData();
         unsubExit();
@@ -74,6 +590,13 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   });
 
   ipcMain.on(IPC_CHANNELS.PTY_WRITE, (_event, id: SurfaceId, data: string) => {
+    // This channel is the HUMAN's keyboard, and only that: it originates in the
+    // terminal component. wmux's own relayed answers (pane.answer_agent) go
+    // straight to ptyManager.write in main, so they cannot reach here — which is
+    // what keeps answerAgent's "answering never clears blocked" rule intact
+    // while still letting a human who typed the answer themselves clear it
+    // (issue #151).
+    noteHumanInput(id, data);
     ptyManager.write(id, data);
   });
 
@@ -83,6 +606,7 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 
   ipcMain.on(IPC_CHANNELS.PTY_KILL, (_event, id: SurfaceId) => {
     ptyManager.kill(id);
+    forgetSurface(id);
   });
 
   ipcMain.handle(IPC_CHANNELS.PTY_HAS, (_event, id: SurfaceId) => {
@@ -91,6 +615,11 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 
   ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_SHELLS, async () => {
     return detectShells();
+  });
+
+  // Installed font families for the Settings font picker (issue #89).
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_FONTS, async () => {
+    return listSystemFonts();
   });
 
   ipcMain.on(IPC_CHANNELS.SYSTEM_OPEN_EXTERNAL, (_event, url: string) => {
@@ -147,7 +676,12 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   });
 
   ipcMain.handle(IPC_CHANNELS.CONFIG_RELOAD_USER_CONFIG, async () => {
-    const cfg = loadUserConfig();
+    // See the config.reload pipe handler in index.ts: a reload re-reports the
+    // file's remaining problems instead of staying quiet about pre-edit ones.
+    resetConfigWarnings();
+    // A reload covers everything under ~/.wmux, so edited community
+    // translations (issue #147) apply without a restart too.
+    const cfg = { ...loadUserConfig(), locales: loadUserLocales() };
     // Broadcast to every open window so all surfaces live-apply the new prefs.
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
@@ -196,6 +730,68 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   ipcMain.handle(IPC_CHANNELS.WINDOW_IS_MAXIMIZED, (e) =>
     BrowserWindow.fromWebContents(e.sender)?.isMaximized() ?? false
   );
+  // Window transparency (Win11 backdrop material). Applied to every window, not
+  // just the sender: the pref is global, and a second window left opaque while
+  // the first turned translucent reads as a bug.
+  // `handle`, not `on`: entering or leaving plain-alpha mode cannot be applied
+  // to a live window, and the renderer needs that answer to tell the user.
+  ipcMain.handle(IPC_CHANNELS.WINDOW_SET_BACKDROP, (e, enabled: boolean, material?: string) => {
+    const safe = toWindowMaterial(material);
+    // The enum was validated; the CAPABILITY was not. A blur material on a host
+    // that has none leaves a zero-alpha window with nothing drawn behind it —
+    // a black window, which is precisely what supportsBackdropMaterial() exists
+    // to prevent. Today's only caller pre-gates, but the guard belongs at the
+    // boundary rather than in the callers that happen to exist right now.
+    const available = safe === 'clear' ? supportsTransparency() : supportsBackdropMaterial();
+    // e.sender, so the restart answer describes the window that asked.
+    return windowManager.setBackdrop(enabled === true && available, safe, e.sender);
+  });
+  // Two separate capabilities: plain alpha needs only DWM, the blur materials
+  // need Win11. Reporting one flag for both would hide transparency from every
+  // Windows 10 user for the sake of a mode they were not asking for.
+  // Frameless (clear) windows have no native caption buttons, so the renderer
+  // draws its own and needs a way to close the window it is running in.
+  ipcMain.on(IPC_CHANNELS.WINDOW_CLOSE_SELF, (e) => {
+    BrowserWindow.fromWebContents(e.sender)?.close();
+  });
+  // Switching into or out of clear mode rebuilds the window, so the pref can
+  // only land on a fresh process.
+  ipcMain.handle(IPC_CHANNELS.WINDOW_IS_FRAMELESS, (e) =>
+    windowManager.isFramelessFor(e.sender),
+  );
+  ipcMain.on(IPC_CHANNELS.WINDOW_RELAUNCH, () => {
+    app.relaunch();
+    app.quit();
+  });
+  ipcMain.handle(IPC_CHANNELS.WINDOW_SUPPORTS_BACKDROP, () => ({
+    transparency: supportsTransparency(),
+    materials: supportsBackdropMaterial(),
+  }));
+  // Taskbar progress: renderer sends its OSC 9;4 aggregate for this window.
+  ipcMain.on(IPC_CHANNELS.WINDOW_SET_PROGRESS, (e, value: number, mode?: string) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win || win.isDestroyed()) return;
+    const validModes = ['none', 'normal', 'indeterminate', 'error', 'paused'];
+    const safeMode = (validModes.includes(mode ?? '') ? mode : 'normal') as
+      'none' | 'normal' | 'indeterminate' | 'error' | 'paused';
+    win.setProgressBar(typeof value === 'number' ? value : -1, { mode: safeMode });
+  });
+
+  /**
+   * Flash the taskbar button when an agent starts waiting on the user.
+   *
+   * Delegated to NotificationManager, which already owned both halves and
+   * already refuses to flash a FOCUSED window — the point is to reach a user
+   * looking elsewhere, and blinking the window they are in is noise they cannot
+   * act on any faster for. Windows clears the flash itself on focus, so the off
+   * path is mostly for a block that resolves while the user is still away.
+   */
+  ipcMain.on(IPC_CHANNELS.WINDOW_FLASH, (e, on: boolean) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win || win.isDestroyed()) return;
+    if (on) notificationManager.flashTaskbar(win);
+    else notificationManager.stopFlash(win);
+  });
 
   ipcMain.on(
     IPC_CHANNELS.CDP_ATTACH,
@@ -213,6 +809,61 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
     if (webContentsId === undefined || cdpProxyInstance?.currentWebContentsId === webContentsId) {
       cdpProxyInstance?.setWebContentsId(null);
     }
+  });
+
+  /**
+   * Cheap enough to call on every entry into agent mode — `agentBrowserPath()`
+   * is memoised (#176) and `isAvailable` is a boolean field, so neither touches
+   * the filesystem or a socket here.
+   */
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_STATUS, () => ({
+    installed: agentBrowserPath() !== null,
+    dashboardAvailable: dashboardDaemon.isAvailable,
+  }));
+
+  ipcMain.handle(
+    IPC_CHANNELS.AGENT_BROWSER_ENABLE,
+    (event, surfaceId: string, currentUrl?: string) => {
+      // Record the owner BEFORE the session exists. A window destroyed while
+      // `enable` is still in flight would otherwise sweep nothing and leak the
+      // Chrome that call is in the middle of starting.
+      ownAgentBrowserSurface(surfaceId as SurfaceId, event.sender);
+      return enableAgentBrowser(surfaceId as SurfaceId, currentUrl, agentBrowserDeps);
+    },
+  );
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_DISABLE, (_event, surfaceId: string) => {
+    agentBrowserOwners.delete(surfaceId as SurfaceId);
+    return disableAgentBrowser(surfaceId as SurfaceId, agentBrowserDeps);
+  });
+
+  /** Where the agent actually is — see the channel's note in types.ts. */
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_CURRENT_URL, (_event, surfaceId: string) =>
+    agentBrowserCurrentUrl(surfaceId as SurfaceId, agentBrowserDeps));
+
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_OPEN, (_event, surfaceId: string, url: string) =>
+    agentBrowserOpen(surfaceId as SurfaceId, url, agentBrowserDeps));
+
+  /**
+   * Install agent-browser in a REAL terminal pane, not a hidden child process.
+   *
+   * This is ~240 MB of npm plus a Chrome-for-Testing download, and every way it
+   * fails — a corporate proxy, EACCES on the global prefix, no network — is
+   * only diagnosable from the output. A spinner that ends in "install failed"
+   * would be strictly less useful than the scrollback the user can read, paste
+   * into an issue, and retry from.
+   */
+  ipcMain.handle(IPC_CHANNELS.AGENT_BROWSER_INSTALL, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return { started: false };
+    const created = await win.webContents.executeJavaScript(`
+      window.__wmux_splitPane?.({
+        direction: 'vertical',
+        type: 'terminal',
+        startupCommands: ['npm i -g agent-browser', 'agent-browser install'],
+      }) ?? null
+    `);
+    return { started: created !== null };
   });
 
   ipcMain.handle(IPC_CHANNELS.AGENT_LIST, async (_event, workspaceId?: string) => {
@@ -233,16 +884,82 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   // return garbled text on Windows when the source app wrote a non-UTF-8 format.
   ipcMain.handle('clipboard:read-text', () => clipboard.readText());
 
-  // Clipboard image paste: save clipboard image to temp file, return path
-  ipcMain.handle('clipboard:paste-image', async () => {
-    const img = clipboard.readImage();
-    if (img.isEmpty()) return null;
-    const tmpDir = path.join(os.tmpdir(), 'wmux');
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const filePath = path.join(tmpDir, `screenshot-${Date.now()}.png`);
-    fs.writeFileSync(filePath, img.toPNG());
-    return filePath;
-  });
+  /**
+   * What should a paste or a drop type into this surface?
+   *
+   * Main owns every input to that question — the clipboard, the detector, the
+   * filesystem, scp, the config — so it answers the whole thing rather than
+   * handing the renderer several round trips worth of raw material.
+   *
+   * The session is looked up here rather than accepted from the renderer: a
+   * destination arriving over IPC is renderer-supplied data, and this path
+   * spawns a process with it. Re-detecting means the only reachable hosts are
+   * ones main already determined the pane is connected to.
+   */
+  const resolveFor = async (
+    surfaceId: SurfaceId,
+    source: PasteSource,
+    mode: 'paste' | 'drop',
+    invert = false,
+    signal?: AbortSignal,
+  ): Promise<InsertionResult> => {
+    // Only arm the ssh probe when there is something uploadable. It spawns a
+    // PowerShell enumeration of every process on the machine (~550ms) and then
+    // re-runs on a timer, and `start()` resets its idle counter — so waking it
+    // from a plain text paste would keep that sweep alive for as long as the
+    // user keeps pasting, to answer a question text can never ask.
+    if (source.kind !== 'files') return resolveInsertion(source, null, false, signal);
+    const mayUpload = !invert && uploadEnabled(loadUserConfig().remote, mode);
+    if (!mayUpload) return resolveInsertion(source, null, false, signal);
+    // Only arm the probe for a pane something already says is remote. `start()`
+    // resets the idle counter, so waking it for a local pane would keep a
+    // ~550ms process sweep running every 3s for as long as the user keeps
+    // pasting files — and `refresh()` cannot answer anything but null there.
+    const remoteHint = sshDetector.remoteHint(surfaceId);
+    if (!remoteHint) return resolveInsertion(source, null, true, signal);
+    sshDetector.start();
+    const session = await sshDetector.refresh(surfaceId);
+    if (!session) {
+      return {
+        text: null,
+        failure: {
+          destination: remoteHint,
+          detail: 'wmux could not safely verify the active SSH destination',
+        },
+      };
+    }
+    return resolveInsertion(source, session, true, signal);
+  };
+
+  ipcMain.handle(
+    IPC_CHANNELS.REMOTE_RESOLVE_PASTE,
+    (event, surfaceId: SurfaceId) => {
+      if (!ownsLiveSurface(surfaceId, event.sender)) return { text: null };
+      // Snapshot before queueing: a slow earlier upload must not make this
+      // gesture read whatever happens to be on the clipboard later.
+      const source = readClipboardSource();
+      return insertionQueue.enqueue(
+        surfaceId,
+        (signal) => resolveFor(surfaceId, source, 'paste', false, signal),
+      );
+    },
+  );
+
+  /**
+   * Files dropped on a pane — the renderer already resolved those to real paths
+   * via webUtils, so they arrive here rather than being read from the clipboard.
+   */
+  ipcMain.handle(
+    IPC_CHANNELS.REMOTE_RESOLVE_DROP,
+    (event, surfaceId: SurfaceId, localPaths: unknown, invert: boolean) => {
+      if (!ownsLiveSurface(surfaceId, event.sender)) return { text: null };
+      const source: PasteSource = { kind: 'files', localPaths: regularFilePaths(localPaths) };
+      return insertionQueue.enqueue(
+        surfaceId,
+        (signal) => resolveFor(surfaceId, source, 'drop', Boolean(invert), signal),
+      );
+    },
+  );
 
   ipcMain.handle(IPC_CHANNELS.SESSION_SAVE_NAMED, (_event, session: any) => {
     saveNamedSession(session);
@@ -254,22 +971,26 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   ipcMain.handle(IPC_CHANNELS.SESSION_LIST_NAMED, () => {
     return listNamedSessions();
   });
-  // Return the most recent auto-saved session in the flattened shape the
-  // renderer's restore code already understands. Used on app launch so the
-  // workspaces / splits / tabs persisted by the 30s rolling save are actually
-  // rehydrated (instead of the renderer falling back to a fresh "Session 1").
-  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_AUTO, () => {
-    const data = loadSession();
-    const win = data?.windows?.[0];
-    if (!win) return null;
-    const activeIndex = win.activeWorkspaceId
-      ? win.workspaces.findIndex(w => w.id === win.activeWorkspaceId)
-      : 0;
-    return {
-      workspaces: win.workspaces,
-      sidebarWidth: win.sidebarWidth,
-      activeIndex: activeIndex >= 0 ? activeIndex : 0,
-    };
+  // Return the auto-saved session in the flattened shape the renderer's restore
+  // code already understands. Used on app launch so the workspaces / splits /
+  // tabs persisted by the 30s rolling save are actually rehydrated (instead of
+  // the renderer falling back to a fresh "Session 1").
+  //
+  // Answered per window (issue #118): main primes each restored window's slot
+  // at creation, so a window gets back its own workspaces. Returning windows[0]
+  // to every caller — the old behaviour — meant a window opened during the run
+  // came up as a clone of the first window's tabs, and multi-window sessions
+  // could never restore more than one window's worth of state.
+  ipcMain.handle(IPC_CHANNELS.SESSION_LOAD_AUTO, (event) => {
+    const windowId = windowManager.idForWebContents(event.sender);
+    if (windowId) {
+      return restoreAnswerFor(sessionWindows.get(windowId), {
+        startup: sessionWindows.isStartup(windowId),
+      });
+    }
+    // Unattributable sender: fall back to the file's first window rather than
+    // leaving a legitimately-restored window empty.
+    return toRestorePayload(loadSession()?.windows?.[0] ?? null);
   });
   // Settings persistence (issue #19) — file-backed in %APPDATA%\wmux so prefs
   // survive portable-zip updates. get-all is synchronous so the renderer's
@@ -279,6 +1000,80 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   });
   ipcMain.on('settings:set', (_event, key: string, value: unknown) => {
     saveSetting(key, value);
+  });
+
+  // Community translations (~/.wmux/locales/*.json, issue #147). Synchronous
+  // for the same reason as settings:get-all-sync, plus one of its own: the
+  // persisted-language guard rejects any code the registry doesn't know, so a
+  // user-defined language has to be merged in *before* the store initializes or
+  // it would reset to English on every restart.
+  ipcMain.on('locales:get-all-sync', (event) => {
+    try {
+      event.returnValue = loadUserLocales();
+    } catch {
+      event.returnValue = { locales: [], errors: [], dir: '' };
+    }
+  });
+
+  // The #128 back-channel from the sidebar: answer a blocked pane in place.
+  // Routed through the same V2 handler the CLI and pipe clients use, so there
+  // is exactly one implementation of "what does answering mean" — including the
+  // refusals (pane no longer asking, choice already consumed).
+  ipcMain.handle(IPC_CHANNELS.AGENT_ANSWER, (_event, surfaceId: string, choiceId: string) =>
+    new Promise((resolve) => {
+      const handled = handleAgentStateV2(
+        'pane.answer_agent',
+        { surfaceId, choiceId },
+        (result: any) => resolve({ ok: true, ...result }),
+        (_code: number, message: string) => resolve({ ok: false, error: message }),
+      );
+      if (!handled) resolve({ ok: false, error: 'answer_agent not routed' });
+    }),
+  );
+
+  // Seed for the delta-only AGENT_STATE channel. A window opened after agents
+  // were already running received nothing until each next reported — a fresh
+  // window showed an empty roster beside three busy panes, and a blocked agent
+  // that is waiting reports nothing at all, so it could stay invisible forever.
+  ipcMain.handle(IPC_CHANNELS.AGENT_STATE_LIST, () => listAgentStates());
+
+  // Same bootstrap problem, same shape: AGENT_IDENTITY is delta-only, and a
+  // pane whose shell spec named an agent at create time never emits again.
+  ipcMain.handle(IPC_CHANNELS.AGENT_IDENTITY_LIST, () => agentIdentity.list());
+
+  // The detection loop's mirror. `on`, not `handle`: the renderer is reporting,
+  // not asking, and making it await an ack would put the loop's cadence on the
+  // far side of an IPC round trip.
+  ipcMain.on(IPC_CHANNELS.AGENT_DETECTION, (_event, surfaceId: string, result: any) => {
+    if (typeof surfaceId === 'string') setDetection(surfaceId, result ?? null);
+  });
+
+  // Manifests flow the other way: main owns the config directory, the renderer
+  // owns the loop that uses them.
+  ipcMain.handle(IPC_CHANNELS.AGENT_DETECTION_MANIFESTS, () => activeManifests());
+
+  // Agent-integration consent (issue #132). Deliberately NOT routed through the
+  // generic settings:set above: changing this decision has to reconcile the files
+  // in the user's home right away — switching a feature off has to remove what it
+  // wrote, or the toggle would only stop future writes and leave the current ones
+  // in place, which is the original complaint one level down.
+  ipcMain.handle('integration:get', () => readConsent());
+  ipcMain.handle('integration:set', (_event, partial: Parameters<typeof updateConsent>[0]) =>
+    updateConsent(partial ?? {}),
+  );
+
+  // OS display-language list for first-launch UI language detection (issue #114).
+  // navigator.language follows Chromium's locale resolution, which on Windows can
+  // pick up regional-format/Accept-Language settings and disagree with the actual
+  // display language — an English Windows reported French. GetUserPreferredUILanguages
+  // (what getPreferredSystemLanguages wraps) is the authoritative signal. Synchronous
+  // because the Zustand settings slice hydrates at module-load time.
+  ipcMain.on('system:get-preferred-languages-sync', (event) => {
+    try {
+      event.returnValue = app.getPreferredSystemLanguages();
+    } catch {
+      event.returnValue = [];
+    }
   });
 
   ipcMain.handle(IPC_CHANNELS.SESSION_DELETE_NAMED, (_event, name: string) => {
@@ -304,41 +1099,357 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
   // the file applying the SAME guards as the markdown.load_file pipe handler
   // (extension whitelist + 5 MB cap) so the manual path can't slurp secrets.
   ipcMain.handle(IPC_CHANNELS.MARKDOWN_OPEN_FILE, async (event) => {
-    const ALLOWED_MD_EXT = new Set(['.md', '.markdown', '.mdx', '.txt', '.text', '.rst']);
-    const MAX_MD_BYTES = 5 * 1024 * 1024;
     const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const result = await dialog.showOpenDialog(win as BrowserWindow, {
       title: 'Open Markdown File',
       properties: ['openFile'],
       filters: [
-        { name: 'Markdown / Text', extensions: ['md', 'markdown', 'mdx', 'txt', 'text', 'rst'] },
+        { name: 'Markdown / Text', extensions: MD_DIALOG_EXTENSIONS },
         { name: 'All Files', extensions: ['*'] },
       ],
     });
     if (result.canceled || result.filePaths.length === 0) {
       return { canceled: true };
     }
-    const filePath = result.filePaths[0];
-    const ext = path.extname(filePath).toLowerCase();
-    if (!ALLOWED_MD_EXT.has(ext)) {
-      return { error: `Unsupported file type: ${ext || '(none)'}` };
-    }
-    let stat: fs.Stats;
-    try { stat = fs.statSync(filePath); } catch { return { error: 'File not found' }; }
-    if (!stat.isFile() || stat.size > MAX_MD_BYTES) {
-      return { error: 'File is not a regular file or exceeds 5MB limit' };
-    }
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      return { filePath, content };
-    } catch (err: any) {
-      return { error: err?.message || 'Failed to read file' };
-    }
+    // The "All Files" filter lets the user pick anything, so the whitelist still
+    // has to be enforced after the dialog — the filter is a convenience, not a guard.
+    const read = readMarkdownFile(result.filePaths[0]);
+    // The user chose this file in a native dialog, so editing and saving it back
+    // is what they asked for. That consent is what the grant set records (F3).
+    if (!('error' in read)) grantFilePath(event.sender.id, read.filePath);
+    return read;
   });
+
+  // Markdown viewer (issue #116): re-read a file the pane already knows about.
+  // Backs "Reload from disk" (agents rewrite files under the pane constantly)
+  // and drag-and-drop of a file onto a markdown pane. Same guards as every
+  // other read — the renderer supplies the path, so it is treated as untrusted.
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_READ_FILE, async (_event, filePath: string) => {
+    return readMarkdownFile(filePath);
+  });
+
+  // Markdown viewer (issue #116): the two read-only shell actions on the backing
+  // file. Both are gated on the extension whitelist — without it, `openPath` on
+  // a renderer-supplied path is an arbitrary-program launcher, which is a much
+  // bigger capability than "open the doc I'm reading in Typora".
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_REVEAL, async (_event, filePath: string) => {
+    if (!isAllowedMarkdownPath(filePath)) return { error: 'Unsupported file type', code: 'unsupported_type' };
+    shell.showItemInFolder(filePath);
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_OPEN_IN_APP, async (_event, filePath: string) => {
+    if (!isAllowedMarkdownPath(filePath)) return { error: 'Unsupported file type', code: 'unsupported_type' };
+    const err = await shell.openPath(filePath);
+    return err ? { error: err, code: 'action_failed' } : { ok: true };
+  });
+
+  // Markdown editing (issue #116, F3). Re-stat only — backs the on-focus
+  // "changed on disk?" check, which needs the mtime and not the content.
+  ipcMain.handle(IPC_CHANNELS.MARKDOWN_STAT_FILE, async (_event, filePath: string) => {
+    return statMarkdownFile(filePath);
+  });
+
+  // ─── File explorer and code viewer ─────────────────────────────────────────
+  // Every one of these takes a surfaceId and a RELATIVE path; main owns the
+  // root. A renderer-supplied root would not be a jail at all — a compromised
+  // renderer would simply pass 'C:\'.
+  //
+  // The gate below is written once and shared by all five handlers rather than
+  // pasted into each: it is the security boundary, and five copies of a
+  // boundary is five chances for one of them to drift.
+  const explorerRootFor = (
+    surfaceId: unknown,
+    sender: Electron.WebContents,
+  ): { realRoot: string } | ExplorerListError => {
+    // The ownership gate every other surface-addressed handler in this file
+    // uses: a window may only ask about a live surface it owns. `no_root` is
+    // the reply on purpose — it is the honest, already-translated "nothing to
+    // show for this pane", and it leaks nothing about whether the surface
+    // exists in another window.
+    if (!ownsLiveSurface(surfaceId, sender)) {
+      return { error: 'No working directory reported for this pane', code: 'no_root' };
+    }
+    const root = getExplorerRoot(surfaceId);
+    if (!root) return { error: 'No working directory reported for this pane', code: 'no_root' };
+    // A pane inside ssh reports a cwd on the OTHER machine. Acting on it
+    // locally would touch whatever coincidentally exists at that path on
+    // Windows. detect() and not refresh(): refresh() runs a Win32_Process
+    // sweep, and this runs on the pane-switch path.
+    //
+    // detect() returns null (i.e. "local") in two states where the pane is
+    // actually remote or ambiguous: the nested-ssh disagreement between a
+    // managed and a reported destination, and probe-only evidence with no
+    // authoritative source. Neither is exploitable today ONLY because no
+    // remote shell runs wmux's report_pwd integration, so no remote cwd ever
+    // reaches explorer-roots' map in the first place — that is a property of
+    // today's report_pwd sources, not of this gate. If a future cwd source
+    // ever feeds a remote path in here, this check would need to widen past
+    // detect()'s null to catch that too.
+    if (sshDetector.detect(surfaceId)) {
+      return { error: 'This pane is inside an SSH session', code: 'remote' };
+    }
+    // realRoot, never cwd: cwd is what the shell reported and is display-only.
+    // realRoot is the realpath'd value the jail is defined in terms of.
+    return { realRoot: root.realRoot };
+  };
+
+  /** Gate + jail in one step: the absolute path, or the error to hand back. */
+  const resolveExplorerPath = async (
+    surfaceId: unknown,
+    relPath: unknown,
+    sender: Electron.WebContents,
+    leaf: 'dir' | 'file' | 'any',
+  ): Promise<{ abs: string } | ExplorerListError> => {
+    const root = explorerRootFor(surfaceId, sender);
+    if ('error' in root) return root;
+    return resolveInRoot(root.realRoot, typeof relPath === 'string' ? relPath : '', leaf);
+  };
+
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_LIST_DIR,
+    async (event, surfaceId: unknown, relPath: unknown, opts?: { showHidden?: boolean }) => {
+      const root = explorerRootFor(surfaceId, event.sender);
+      if ('error' in root) return root;
+      return listDir(root.realRoot, typeof relPath === 'string' ? relPath : '', {
+        showHidden: !!opts?.showHidden,
+      });
+    },
+  );
+
+  // Code viewer. This handler is where the code viewer's security boundary
+  // actually lives — code-file.ts's deny-list is a UX filter, and resolveInRoot
+  // is what keeps a renderer-supplied path inside the pane's folder.
+  //
+  // A successful read MINTS A WRITE GRANT. #210 shipped this handler without
+  // that line and argued against adding it; see file-grants.ts for the argument
+  // and for why the editor's transaction is a different one. In short: the path
+  // came through the jail, the user clicked a row in a tree to get here, and
+  // the grant is what lets Ctrl+S write back to this file and nothing else.
+  ipcMain.handle(
+    IPC_CHANNELS.CODE_READ_FILE,
+    async (event, surfaceId: unknown, relPath: unknown) => {
+      const resolved = await resolveExplorerPath(surfaceId, relPath, event.sender, 'file');
+      if ('error' in resolved) return resolved;
+      const read = readCodeFile(resolved.abs);
+      if (!('error' in read)) grantFilePath(event.sender.id, read.filePath);
+      return read;
+    },
+  );
+
+  // Write it back. Three gates, and all three are load-bearing:
+  //
+  //   1. resolveInRoot  — inside the pane's folder, no symlinked segment
+  //   2. the grant set  — and opened into a live pane in THIS window
+  //   3. expectedMtimeMs — and unchanged on disk since it was read
+  //
+  // (2) is what the jail alone does not give: without it a compromised renderer
+  // gets arbitrary write access across the user's whole project, which is
+  // precisely what #210 refused. (3) is what makes the feature usable at all
+  // next to a working agent — see writeCodeFile.
+  ipcMain.handle(
+    IPC_CHANNELS.CODE_WRITE_FILE,
+    async (event, surfaceId: unknown, relPath: unknown, content: unknown, expectedMtimeMs?: unknown) => {
+      const resolved = await resolveExplorerPath(surfaceId, relPath, event.sender, 'file');
+      if ('error' in resolved) return resolved;
+      if (!isFilePathGranted(event.sender.id, resolved.abs)) {
+        return { error: 'This file was not opened in a pane in this window', code: 'not_granted' };
+      }
+      return writeCodeFile(
+        resolved.abs,
+        typeof content === 'string' ? content : '',
+        Number.isFinite(expectedMtimeMs) ? Number(expectedMtimeMs) : undefined,
+      );
+    },
+  );
+
+  // A markdown read that goes THROUGH the jail — and therefore mints, where
+  // MARKDOWN_READ_FILE does not.
+  //
+  // #210 wrote this handler, then deleted it on review, on the grounds that
+  // "jailed to a pane root" is not consent. It is reinstated deliberately, with
+  // the consequence #210 declined, because the alternative is the gap that
+  // reasoning predicted verbatim: "I opened it in wmux, why can't I save it?".
+  // What makes it acceptable now is that it is not the whole answer — the write
+  // side adds the grant check AND the mtime guard, so the blast radius is
+  // "files the user opened into a pane in this window", not "the project root".
+  //
+  // Still narrower than the code read in one way that matters: readMarkdownFile
+  // keeps its extension whitelist. The jail is added to that guard, not swapped
+  // in for it.
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_READ_MARKDOWN,
+    async (event, surfaceId: unknown, relPath: unknown) => {
+      const resolved = await resolveExplorerPath(surfaceId, relPath, event.sender, 'file');
+      if ('error' in resolved) return resolved;
+      const read = readMarkdownFile(resolved.abs);
+      if (!('error' in read)) grantFilePath(event.sender.id, read.filePath);
+      return read;
+    },
+  );
+
+  // The tree's +N/-N column. Reuses the explorer's root gate rather than
+  // `diff:get-files`, which takes an absolute cwd straight from the renderer —
+  // that channel predates the jail and carries the pattern #210 exists to
+  // reject. Same provider underneath either way, so the DiffPane and the tree
+  // cannot disagree about what changed.
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_DIFF_STATS,
+    async (event, surfaceId: unknown) => {
+      const root = explorerRootFor(surfaceId, event.sender);
+      if ('error' in root) return root;
+      try {
+        const { files, baseline } = await getChangedFilesWithBaseline(root.realRoot);
+        return { root: root.realRoot, files, baseline };
+      } catch (err: any) {
+        // A git spawn can fail for reasons that are not the user's problem (no
+        // git on PATH, a repo mid-rebase). The tree simply shows no numbers
+        // rather than an error banner over a working file list.
+        console.error('[explorer] diff stats failed:', err?.message ?? err);
+        return { error: 'Failed to read changes', code: 'read_failed' };
+      }
+    },
+  );
+
+  // Reveal in File Explorer. Every listed entry qualifies, folders and binaries
+  // included: showItemInFolder only selects the item, it executes nothing.
+  // Gating this on the markdown extension whitelist (which is what the tree
+  // used to call) made it a silent no-op for every ordinary source file.
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_REVEAL,
+    async (event, surfaceId: unknown, relPath: unknown) => {
+      const resolved = await resolveExplorerPath(surfaceId, relPath, event.sender, 'any');
+      if ('error' in resolved) return resolved;
+      shell.showItemInFolder(resolved.abs);
+      return { ok: true };
+    },
+  );
+
+  // Open in the default app. Unlike reveal, this one RUNS things — for an
+  // .exe or a .ps1 the "default app" is the file itself or an interpreter — so
+  // the jail is not sufficient on its own and EXEC_EXT refuses those outright.
+  ipcMain.handle(
+    IPC_CHANNELS.EXPLORER_OPEN_IN_APP,
+    async (event, surfaceId: unknown, relPath: unknown) => {
+      const resolved = await resolveExplorerPath(surfaceId, relPath, event.sender, 'any');
+      if ('error' in resolved) return resolved;
+      // FILES only. The deny-list reads an extension off a basename, and a
+      // DIRECTORY may perfectly well be called `tools.exe` or `scripts.py` —
+      // opening one just shows it in Explorer and runs nothing, so refusing it
+      // would be the same wrong-predicate mistake `viewable` made on this menu.
+      // The lstat cannot be skipped by trusting the tree's `kind`: that came
+      // from the renderer, and this is the branch that decides whether a path
+      // reaches the shell.
+      let isDir: boolean;
+      try {
+        isDir = (await fsp.lstat(resolved.abs)).isDirectory();
+      } catch {
+        return { error: 'File not found', code: 'not_found' };
+      }
+      if (!isDir && isExecutablePath(resolved.abs)) {
+        return { error: 'Refusing to launch an executable', code: 'executable' };
+      }
+      const failure = await shell.openPath(resolved.abs);
+      // openPath resolves with a MESSAGE on failure and '' on success — it does
+      // not reject, so an unchecked call reports success for a file no app can
+      // open. The message is path-bearing, so it is logged, never returned.
+      if (failure) {
+        console.error('[explorer] openPath failed:', failure);
+        return { error: 'Failed to open file', code: 'read_failed' };
+      }
+      return { ok: true };
+    },
+  );
+
+  // Save in place. The path comes from the renderer's store, so it is only
+  // honoured if it is in this window's grant set — see ./markdown-grants for
+  // why a renderer-supplied write path is treated as attacker-controlled.
+  ipcMain.handle(
+    IPC_CHANNELS.MARKDOWN_SAVE_FILE,
+    async (event, filePath: string, content: string, expectedMtimeMs?: number) => {
+      if (!isFilePathGranted(event.sender.id, filePath)) {
+        return { error: 'This file was not opened in wmux — use Save As', code: 'not_granted' };
+      }
+      return writeMarkdownFile(filePath, content, expectedMtimeMs);
+    },
+  );
+
+  // Save As: the native dialog is the user's consent, so a confirmed
+  // destination both gets written and becomes a grant for later in-place saves.
+  ipcMain.handle(
+    IPC_CHANNELS.MARKDOWN_SAVE_AS,
+    async (event, content: string, suggestedName?: string, defaultDir?: string) => {
+      const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+      const result = await dialog.showSaveDialog(win as BrowserWindow, {
+        title: 'Save Markdown File',
+        defaultPath: suggestedName
+          ? path.join(defaultDir || '', suggestedName)
+          : path.join(defaultDir || '', 'untitled.md'),
+        filters: [{ name: 'Markdown / Text', extensions: MD_DIALOG_EXTENSIONS }],
+      });
+      if (result.canceled || !result.filePath) return { canceled: true };
+      const written = writeMarkdownFile(result.filePath, content);
+      if ('ok' in written) {
+        grantFilePath(event.sender.id, result.filePath);
+        return { ...written, filePath: result.filePath };
+      }
+      return written;
+    },
+  );
 
   // Folder picker (issue #64): backs the `openFolder` shortcut (Ctrl+O). Shows a
   // native directory dialog and returns the chosen path; the renderer opens a new
   // workspace rooted there. Previously `openFolder` was a bound-but-no-op stub.
+  // "Open in wmux" Explorer verb (HKCU shell keys — see shell-context-menu.ts).
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU, () => {
+    try {
+      return isContextMenuInstalled();
+    } catch {
+      return false;
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, (_event, enabled: boolean, label?: string) => {
+    try {
+      if (enabled) {
+        // app.getPath('exe') is Electron's own binary in dev, which is correct:
+        // the verb then launches the dev build, and the user gets what they see.
+        installContextMenu(app.getPath('exe'), label || 'Open in wmux');
+      } else {
+        uninstallContextMenu();
+      }
+      // Report the state actually achieved, not the state requested — a partial
+      // registry write must not leave the toggle claiming success.
+      return { ok: true, enabled: isContextMenuInstalled() };
+    } catch (err) {
+      return { ok: false, enabled: isContextMenuInstalled(), error: (err as Error).message };
+    }
+  });
+
+  // Windows shell icon cache (issues #137/#226). The confirm lives HERE, not in
+  // the renderer: the action closes every File Explorer window the user has
+  // open, and the process that does it must be the one that said so.
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_REFRESH_ICON_CACHE, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const { response } = await dialog.showMessageBox(win as BrowserWindow, {
+      type: 'warning',
+      title: 'wmux',
+      message: 'Restart Windows Explorer to refresh the icon cache?',
+      detail:
+        'The taskbar disappears for a second and any open File Explorer windows close. ' +
+        'Your terminals and wmux itself are not affected. This is the only way Windows ' +
+        'lets a taskbar or pinned button pick up a changed icon.',
+      buttons: ['Restart Explorer', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response !== 0) return { ran: false };
+    refreshShellIconCache();
+    return { ran: true };
+  });
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_TAKE_ICON_CHANGE_NOTICE, () => takeIconChangeNotice());
+
   ipcMain.handle(IPC_CHANNELS.SYSTEM_PICK_FOLDER, async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
     const result = await dialog.showOpenDialog(win as BrowserWindow, {
@@ -353,12 +1464,18 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
 }
 
 export function setupAgentPtyForwarding(surfaceId: string, window: BrowserWindow): void {
-  const unsubData = ptyManager.onData(surfaceId as SurfaceId, (data) => {
+  ownSurface(surfaceId as SurfaceId, window.webContents);
+  // Same batching as the PTY_CREATE forwarder — agent panes are the panes most
+  // likely to stream hard, so they need it most.
+  const batcher = createPtyDataBatcher((data) => {
     if (window && !window.isDestroyed()) {
       window.webContents.send(IPC_CHANNELS.PTY_DATA, surfaceId, data);
     }
   });
+  const unsubData = ptyManager.onData(surfaceId as SurfaceId, (data) => batcher.push(data));
   const unsubExit = ptyManager.onExit(surfaceId as SurfaceId, (code) => {
+    batcher.flush();
+    batcher.dispose();
     if (window && !window.isDestroyed()) {
       window.webContents.send(IPC_CHANNELS.PTY_EXIT, surfaceId, code);
     }

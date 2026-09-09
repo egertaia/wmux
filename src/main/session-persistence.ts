@@ -23,7 +23,21 @@ export interface SessionData {
       pinned: boolean;
       shell: string;
       cwd?: string; // last reported working dir — restored so new terminals reopen here (issue #20)
+      // The POSIX/WSL directory. `cwd` is last-writer-wins across both
+      // filesystems, so a pwsh pane leaves a Win32 path there and restored WSL
+      // panes get `--cd ~`; this one is only ever written by a POSIX report.
+      posixCwd?: string;
       splitTree: any; // SplitNode serialized
+      // The renderer has always written these two; the interface omitting them
+      // is what let backupAutoSession drop them without tsc noticing (#145).
+      browserUrl?: string;
+      browserWidth?: number;
+      // Same lifecycle as browserWidth: written by the renderer, and dropped
+      // by backupAutoSession until the interface named it (#145).
+      explorerOpen?: boolean;
+      explorerWidth?: number;
+      explorerExpanded?: Record<string, string[]>;
+      explorerShowHidden?: boolean;
     }>;
   }>;
 }
@@ -34,17 +48,41 @@ export function ensureDirectories(): void {
   }
 }
 
+/**
+ * Write the auto-session, leaving a readable file at every instant (issue #214).
+ *
+ * This was described as an atomic write and was not one. It wrote a temp file,
+ * then `unlink`ed the live `session.json`, then renamed — so between those last
+ * two calls there was no session file on disk at all. Die in that window and
+ * the next launch finds nothing to restore: it falls back to a fresh Session 1
+ * or to an older named session, which re-mints every pane and surface id and so
+ * loses the tab names the user gave them. That is #214's "surfaces come back
+ * with new ids and lose their customTitle", and it needs no explanation beyond
+ * a process that aborts at an unpredictable moment — which is the rest of #214.
+ *
+ * The window was never necessary. The `unlink` is there for a comment that says
+ * "on Windows, rename won't overwrite", and that is true of the Win32
+ * `MoveFileW` but not of Node: libuv's `uv_fs_rename` calls `MoveFileExW` with
+ * `MOVEFILE_REPLACE_EXISTING`, so a plain `renameSync` over an existing file is
+ * both legal and atomic. The old two-step survives only as a FALLBACK, for the
+ * one thing that genuinely can fail the single-step form — a transient sharing
+ * violation from antivirus or a sync client holding the target open, which on a
+ * path under OneDrive is not hypothetical.
+ */
 export function saveSession(data: SessionData): void {
   ensureDirectories();
-  // Atomic write: write to temp file, then rename
   const tmpFile = SESSION_FILE + '.tmp';
   try {
     fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
-    // On Windows, rename won't overwrite, so remove first
-    if (fs.existsSync(SESSION_FILE)) {
-      fs.unlinkSync(SESSION_FILE);
+    try {
+      // One step: the old file is replaced, never absent.
+      fs.renameSync(tmpFile, SESSION_FILE);
+    } catch {
+      // Target locked. Now — and only now — is the unlink worth its window,
+      // because the alternative is not saving at all.
+      try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch { /* the rename below reports */ }
+      fs.renameSync(tmpFile, SESSION_FILE);
     }
-    fs.renameSync(tmpFile, SESSION_FILE);
   } catch (err) {
     // Clean up temp file if it exists
     try { fs.unlinkSync(tmpFile); } catch {}
@@ -69,25 +107,124 @@ export function getSessionPath(): string {
   return SESSION_FILE;
 }
 
+// Auto-backups created by handleVersionChange share this name prefix so they
+// can be recognized and pruned without touching user-named sessions.
+const AUTO_BACKUP_PREFIX = 'Auto-backup';
+const AUTO_BACKUP_KEEP = 3;
+
+/**
+ * Archive the volatile auto-session as a *named* session before it is cleared
+ * on a version change (issue #113: a user lost 20+ renamed tabs by updating
+ * without hitting Save). The auto-session's PTYs died with the old process,
+ * but its layout — titles, colors, splits, cwds — is exactly what a named
+ * session stores, and loading a named session re-spawns fresh PTYs. Because
+ * the post-update startup path already auto-restores the most recent named
+ * session when no auto-session exists, this backup brings the user's tabs
+ * back on the first launch of the new version with zero action on their part.
+ *
+ * Fidelity is the whole contract (issue #145): this file is what the user gets
+ * restored after an update, so it must carry everything a manual Save does. It
+ * previously copied a subset — no browserUrl, browserWidth or pinned — and only
+ * ever looked at windows[0]. Users experienced that as "the autobackup does its
+ * own thing": browsers back on the default page, pinned tabs unpinned, and a
+ * second window's workspaces simply gone.
+ */
+function backupAutoSession(previousVersion: string): void {
+  try {
+    if (!fs.existsSync(SESSION_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8')) as SessionData;
+    const windows = Array.isArray(data?.windows) ? data.windows : [];
+    // Every window's workspaces, in window order. A named session restores into
+    // a single window, so a multi-window layout comes back flattened — losing
+    // the window split is a far smaller surprise than losing the tabs.
+    const workspaces = windows.flatMap(w => (Array.isArray(w?.workspaces) ? w.workspaces : []));
+    if (workspaces.length === 0) return;
+
+    const backup = {
+      name: previousVersion ? `${AUTO_BACKUP_PREFIX} v${previousVersion}` : AUTO_BACKUP_PREFIX,
+      savedAt: Date.now(),
+      workspaces: workspaces.map(w => ({
+        title: w.title,
+        customColor: w.customColor,
+        pinned: !!w.pinned,
+        shell: w.shell,
+        cwd: w.cwd || '',
+        posixCwd: w.posixCwd || '',
+        splitTree: w.splitTree,
+        browserUrl: w.browserUrl || '',
+        browserWidth: w.browserWidth,
+        explorerOpen: w.explorerOpen,
+        explorerWidth: w.explorerWidth,
+        explorerExpanded: w.explorerExpanded,
+        explorerShowHidden: w.explorerShowHidden,
+      })),
+      sidebarWidth: windows[0]?.sidebarWidth ?? 260,
+    };
+
+    // Write directly instead of via saveNamedSession: a safety net must not
+    // hijack the user's last-session pointer.
+    if (!fs.existsSync(SAVED_DIR)) fs.mkdirSync(SAVED_DIR, { recursive: true });
+    fs.writeFileSync(
+      path.join(SAVED_DIR, sanitizeName(backup.name) + '.json'),
+      JSON.stringify(backup, null, 2),
+      'utf-8'
+    );
+    pruneAutoBackups();
+  } catch {
+    /* best-effort — never block startup on a backup failure */
+  }
+}
+
+/** Keep only the newest AUTO_BACKUP_KEEP auto-backups so updates don't pile up clutter. */
+function pruneAutoBackups(): void {
+  try {
+    const backups = fs.readdirSync(SAVED_DIR)
+      .filter(f => f.startsWith(AUTO_BACKUP_PREFIX) && f.endsWith('.json'))
+      .map(f => {
+        const full = path.join(SAVED_DIR, f);
+        try { return { full, savedAt: Number(JSON.parse(fs.readFileSync(full, 'utf-8')).savedAt) || 0 }; }
+        catch { return { full, savedAt: 0 }; }
+      })
+      .sort((a, b) => b.savedAt - a.savedAt);
+    for (const stale of backups.slice(AUTO_BACKUP_KEEP)) {
+      try { fs.unlinkSync(stale.full); } catch {}
+    }
+  } catch {}
+}
+
 /**
  * Returns true if the app version changed (or first launch).
  *
  * Clears only the *auto-restored* session (`session.json`) so the user gets a
  * clean Session 1 on the first launch of a new version — that file can hold a
- * live layout whose PTYs died with the previous process. Explicitly **named**
- * saved sessions (issue #35) are layout-only snapshots that the user chose to
+ * live layout whose PTYs died with the previous process. Its layout is first
+ * archived as an "Auto-backup vX.Y.Z" named session (issue #113) so nothing
+ * the user arranged is ever lost to an update. Explicitly **named** saved
+ * sessions (issue #35) are layout-only snapshots that the user chose to
  * keep, so they MUST survive updates; loading one always re-spawns fresh PTYs
  * (useTerminal calls pty.create when pty.has(surfaceId) is false), so there are
  * no stale handles to freeze. The last-session pointer is preserved too, so the
  * user can reload their last named session after an update.
  */
+/**
+ * The version that last ran on this machine, '' on a fresh install. Read it
+ * BEFORE `handleVersionChange`, which overwrites the file — the stale-icon
+ * notice (#226) needs "was this an upgrade" and that is the only record.
+ */
+export function savedVersion(): string {
+  try {
+    return fs.existsSync(VERSION_FILE) ? fs.readFileSync(VERSION_FILE, 'utf-8').trim() : '';
+  } catch { return ''; }
+}
+
 export function handleVersionChange(currentVersion: string): boolean {
   ensureDirectories();
   try {
     const saved = fs.existsSync(VERSION_FILE) ? fs.readFileSync(VERSION_FILE, 'utf-8').trim() : '';
     if (saved === currentVersion) return false;
-    // Reset only the volatile auto-session. Named sessions (SAVED_DIR) and the
-    // last-session pointer are intentionally preserved across updates.
+    // Archive, then reset, only the volatile auto-session. Named sessions
+    // (SAVED_DIR) and the last-session pointer are intentionally preserved.
+    backupAutoSession(saved);
     try { if (fs.existsSync(SESSION_FILE)) fs.unlinkSync(SESSION_FILE); } catch {}
     fs.writeFileSync(VERSION_FILE, currentVersion, 'utf-8');
     return true;

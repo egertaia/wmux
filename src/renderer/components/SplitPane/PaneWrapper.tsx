@@ -1,13 +1,17 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { PaneId, SplitNode, SurfaceId, WorkspaceId, QuickLaunchProfile, ShellInfo } from '../../../shared/types';
-import { findLeaf, removeLeaf, splitNode } from '../../store/split-utils';
+import { PaneId, SplitNode, SurfaceId, WorkspaceId, QuickLaunchProfile, ShellInfo, engineOf } from '../../../shared/types';
+import { workspaceFallbackCwd } from '../../../shared/paths';
+import { findLeaf, splitNode } from '../../store/split-utils';
 import TerminalPane from '../Terminal/TerminalPane';
 import BrowserPane from '../Browser/BrowserPane';
 import MarkdownPane from '../Markdown/MarkdownPane';
 import DiffPane from '../Diff/DiffPane';
+import CodePane from '../Code/CodePane';
+import PromptsPane from '../Terminal/PromptsPane';
 import NotificationRing from '../Terminal/NotificationRing';
 import SurfaceTabBar from './SurfaceTabBar';
 import { useStore } from '../../store';
+import { keyDismissesAttention } from './attention-dismiss';
 import type { SurfaceDragCommitOptions, SurfaceDragPayload, SurfaceDragPreviewTarget } from './drag-preview-types';
 import {
   getSurfaceDragDropDecision,
@@ -48,7 +52,10 @@ export default function PaneWrapper({
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const addSurface = useStore((s) => s.addSurface);
   const updateSurface = useStore((s) => s.updateSurface);
-  const closeSurface = useStore((s) => s.closeSurface);
+  const requestCloseSurface = useStore((s) => s.requestCloseSurface);
+  const duplicateSurface = useStore((s) => s.duplicateSurface);
+  const closeOtherSurfaces = useStore((s) => s.closeOtherSurfaces);
+  const closeSurfacesToRight = useStore((s) => s.closeSurfacesToRight);
   const selectSurface = useStore((s) => s.selectSurface);
   const moveSurface = useStore((s) => s.moveSurface);
   const splitAndMoveSurface = useStore((s) => s.splitAndMoveSurface);
@@ -60,6 +67,9 @@ export default function PaneWrapper({
   const [availableShells, setAvailableShells] = useState<ShellInfo[]>([]);
 
   const surfaceIds = useMemo(() => surfaces.map((s) => s.id), [surfaces]);
+
+  // Root element — the attention ring's interaction listeners hang off it.
+  const paneRef = useRef<HTMLDivElement>(null);
 
   const hasUnread = useMemo(
     () => notifications.some((n) => !n.read && surfaceIds.includes(n.surfaceId as SurfaceId)),
@@ -96,14 +106,54 @@ export default function PaneWrapper({
     prevUnreadCount.current = currentCount;
   }, [unreadCount]);
 
-  // When pane receives focus, mark all surfaces as read
+  const markPaneRead = useCallback(() => {
+    for (const surfaceId of surfaceIds) markRead(surfaceId as SurfaceId);
+  }, [surfaceIds, markRead]);
+
+  // When pane receives focus, mark all surfaces as read.
+  //
+  // Deliberately keyed on the focus TRANSITION and nothing else. Adding
+  // `hasUnread` here is the tempting one-word fix for the stuck ring below, and
+  // it is wrong: the effect would then run on the same render the notification
+  // arrives, so a pane you are already looking at would clear its ring before
+  // ever painting it — no glow, and the 950ms flash above cut off mid-animation.
+  // That trades a ring that will not leave for one you can never see.
+  //
+  // Still needed alongside the interaction listener: switching panes by keyboard
+  // (Ctrl+Alt+arrow) lands no click and no keystroke inside the new pane.
   useEffect(() => {
-    if (isFocused && hasUnread) {
-      for (const surfaceId of surfaceIds) {
-        markRead(surfaceId as SurfaceId);
-      }
-    }
+    if (isFocused && hasUnread) markPaneRead();
   }, [isFocused]);
+
+  // ...and clear it on actual INTERACTION, which is the case focus alone misses.
+  //
+  // A notification that arrives while the pane is ALREADY focused never changes
+  // `isFocused`, so the effect above does not re-run and the ring sits there
+  // while the user types into the very pane it is pointing at. The only way out
+  // was to click another pane and click back — manufacturing the transition by
+  // hand.
+  //
+  // Capture phase is load-bearing for keydown: xterm's hidden helper textarea is
+  // a descendant of this element and consumes the event, so a bubble-phase
+  // listener here would never see a keystroke — only clicks would dismiss, and
+  // typing (the exact case reported) still would not.
+  //
+  // Attached only while there is something to dismiss, so the common case costs
+  // no listeners at all.
+  useEffect(() => {
+    const el = paneRef.current;
+    if (!hasUnread || !el) return;
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (keyDismissesAttention(e.key)) markPaneRead();
+    };
+    el.addEventListener('keydown', onKeyDown, true);
+    el.addEventListener('mousedown', markPaneRead, true);
+    return () => {
+      el.removeEventListener('keydown', onKeyDown, true);
+      el.removeEventListener('mousedown', markPaneRead, true);
+    };
+  }, [hasUnread, markPaneRead]);
 
   // Keyboard shortcut listeners for find (Ctrl+F) and copy mode (Ctrl+Alt+[)
   useEffect(() => {
@@ -211,9 +261,10 @@ export default function PaneWrapper({
             <TerminalPane
               surfaceId={surface.id}
               shell={surface.shell || workspace?.shell}
-              cwd={surface.cwd || workspace?.cwd}
+              cwd={surface.cwd || workspaceFallbackCwd(surface.shell || workspace?.shell, workspace)}
               colorScheme={surface.colorScheme}
               startupCommands={surface.startupCommands}
+              claudeSessionId={surface.claudeSessionId}
               focused={isFocused && isActive}
               visible={isVisible}
               showFindBar={findBarVisible && isFocused && isActive}
@@ -226,6 +277,13 @@ export default function PaneWrapper({
               surfaceId={surface.id}
               workspaceId={workspaceId}
               {...(surface.url ? { initialUrl: surface.url } : {})}
+              // Read through engineOf, never off the raw field: the session
+              // file is user-editable, so a corrupt value has to degrade to
+              // `web` here exactly as it does in main (v2-browser) and in the
+              // pipe bridge.
+              engine={engineOf(surface)}
+              onEngineChange={(e) =>
+                updateSurface(workspaceId, paneId, surface.id, { browserEngine: e })}
               // Persist the live URL into the surface so a split-tree
               // restructure (which remounts this pane) restores the page the
               // user was on instead of resetting to the default (issue #40).
@@ -236,8 +294,47 @@ export default function PaneWrapper({
               }}
             />
           )}
-          {surface.type === 'markdown' && <MarkdownPane surfaceId={surface.id} content={surface.markdownContent} />}
+          {surface.type === 'markdown' && (
+            <MarkdownPane
+              surfaceId={surface.id}
+              content={surface.markdownContent}
+              filePath={surface.markdownFilePath}
+              viewMode={surface.markdownViewMode}
+              cwd={workspace?.cwd}
+              fileMtime={surface.markdownFileMtime}
+              dirty={surface.markdownDirty}
+              // All of these persist onto the surface (issue #116) so they
+              // survive the remount that a split-tree restructure causes,
+              // exactly like markdownContent itself.
+              onViewModeChange={(mode) =>
+                updateSurface(workspaceId, paneId, surface.id, { markdownViewMode: mode })}
+              onFileLoaded={({ content, filePath, fileName, mtimeMs }) =>
+                updateSurface(workspaceId, paneId, surface.id, {
+                  markdownContent: content,
+                  markdownFilePath: filePath,
+                  markdownFileName: fileName,
+                  markdownFileMtime: mtimeMs,
+                  // A load from disk IS what is on disk, so the buffer is clean
+                  // again — this is also what makes "Discard changes" work.
+                  markdownDirty: false,
+                })}
+              onEdit={(next) =>
+                updateSurface(workspaceId, paneId, surface.id, {
+                  markdownContent: next,
+                  markdownDirty: true,
+                })}
+              onSaved={({ filePath, fileName, mtimeMs }) =>
+                updateSurface(workspaceId, paneId, surface.id, {
+                  markdownFilePath: filePath,
+                  markdownFileName: fileName,
+                  markdownFileMtime: mtimeMs,
+                  markdownDirty: false,
+                })}
+            />
+          )}
           {surface.type === 'diff' && <DiffPane surfaceId={surface.id} cwd={workspace?.cwd} />}
+          {surface.type === 'code' && <CodePane surfaceId={surface.id} />}
+          {surface.type === 'prompts' && <PromptsPane surfaceId={surface.id} />}
         </div>
       );
     });
@@ -248,7 +345,7 @@ export default function PaneWrapper({
     }
   };
 
-  const handleNewSurfaceTyped = (type: 'terminal' | 'browser' | 'markdown') => {
+  const handleNewSurfaceTyped = (type: 'terminal' | 'browser' | 'markdown' | 'prompts') => {
     if (activeWorkspaceId) {
       addSurface(activeWorkspaceId, paneId, type);
     }
@@ -343,10 +440,31 @@ export default function PaneWrapper({
 
   const handleCloseSurface = (surfaceId: SurfaceId) => {
     if (activeWorkspaceId) {
-      // PTY teardown now lives in the store's closeSurface action (issue #65), so
+      // PTY teardown lives in the store's closeSurface action (issue #65), so
       // every close route — this tab-× button, Ctrl+W, and `wmux close-surface` —
-      // reaps the shell through the same chokepoint.
-      closeSurface(activeWorkspaceId, paneId, surfaceId);
+      // reaps the shell through the same chokepoint. User gestures go through
+      // requestCloseSurface first, which stops to confirm when the tab holds
+      // unsaved markdown edits (issue #116, F3).
+      requestCloseSurface(activeWorkspaceId, paneId, surfaceId);
+    }
+  };
+
+  const handleDuplicateSurface = () => {
+    const active = surfaces[activeSurfaceIndex];
+    if (activeWorkspaceId && active) {
+      duplicateSurface(activeWorkspaceId, paneId, active.id);
+    }
+  };
+
+  const handleCloseOtherSurfaces = (surfaceId: SurfaceId) => {
+    if (activeWorkspaceId) {
+      closeOtherSurfaces(activeWorkspaceId, paneId, surfaceId);
+    }
+  };
+
+  const handleCloseSurfacesToRight = (surfaceId: SurfaceId) => {
+    if (activeWorkspaceId) {
+      closeSurfacesToRight(activeWorkspaceId, paneId, surfaceId);
     }
   };
 
@@ -374,19 +492,11 @@ export default function PaneWrapper({
 
   const handleClosePane = () => {
     if (!activeWorkspaceId) return;
-    // Kill all PTYs in this pane first
-    for (const surface of surfaces) {
-      if (surface.type === 'terminal') {
-        window.wmux?.pty?.kill(surface.id);
-      }
-    }
-    // Remove the pane atomically (not surface-by-surface, which corrupts state)
-    const { workspaces, updateSplitTree } = useStore.getState();
-    const ws = workspaces.find(w => w.id === activeWorkspaceId);
-    if (ws) {
-      const newTree = removeLeaf(ws.splitTree, paneId);
-      if (newTree) updateSplitTree(activeWorkspaceId, newTree);
-    }
+    // Reaping and tree surgery both live in the store action now — this button,
+    // `wmux close-pane` and closeSurface's last-tab path had each grown their own
+    // copy, and all three killed the shells before discovering they were not
+    // going to remove anything (a one-pane workspace). See surface-slice.closePane.
+    useStore.getState().closePane(activeWorkspaceId, paneId);
   };
 
   const getSourceLeaf = (sourcePaneId: PaneId) => {
@@ -517,7 +627,10 @@ export default function PaneWrapper({
   };
 
   return (
-    <div className={`pane-wrapper ${isFocused ? 'pane-wrapper--focused' : ''} ${dragActive ? 'pane-wrapper--drag-active' : ''}`}>
+    <div
+      ref={paneRef}
+      className={`pane-wrapper ${isFocused ? 'pane-wrapper--focused' : ''} ${dragActive ? 'pane-wrapper--drag-active' : ''}`}
+    >
       <SurfaceTabBar
         paneId={paneId}
         workspaceShell={workspace?.shell}
@@ -525,6 +638,9 @@ export default function PaneWrapper({
         activeSurfaceIndex={activeSurfaceIndex}
         onSelect={handleSelectSurface}
         onClose={handleCloseSurface}
+        onDuplicate={handleDuplicateSurface}
+        onCloseOthers={handleCloseOtherSurfaces}
+        onCloseToRight={handleCloseSurfacesToRight}
         onNew={handleNewSurface}
         onNewTyped={handleNewSurfaceTyped}
         shells={availableShells}

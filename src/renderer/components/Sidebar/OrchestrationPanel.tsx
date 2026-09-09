@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useStore } from '../../store';
+import { useT } from '../../i18n';
 import { OrchestrationWave, OrchestrationAgent, OrchestrationState } from '../../../shared/types';
 
 /**
@@ -7,6 +8,7 @@ import { OrchestrationWave, OrchestrationAgent, OrchestrationState } from '../..
  * when no orchestration is active. Main process pushes state via IPC.
  */
 export default function OrchestrationPanel() {
+  const t = useT();
   const orch = useStore((s) => s.currentOrchestration);
   const clear = useStore((s) => s.clearOrchestration);
   const [now, setNow] = useState(() => Date.now());
@@ -21,19 +23,28 @@ export default function OrchestrationPanel() {
   }, [orch?.status, orch?.id]);
 
   if (!orch) return null;
+  // Defence in depth: the watcher already rejects malformed state.json, but a
+  // run with no `id`/`waves` must never reach the render body — throwing here
+  // unmounts the whole app (see ErrorBoundary).
+  if (typeof orch.id !== 'string' || !Array.isArray(orch.waves)) return null;
 
-  const elapsedMs = Math.max(0, now - parseIso(orch.startedAt));
-  const elapsed = formatElapsed(elapsedMs);
+  // parseIso returns 0 for a missing/unparseable startedAt, and `now - 0` is the
+  // whole Unix epoch — the panel rendered "495520:02:09" for a run that had been
+  // going ten minutes. An unknown start time is not a 56-year-old run: show that
+  // we don't know it. (The plugin's schema is `startedAt`; runs that write some
+  // other key land here.)
+  const startedMs = parseIso(orch.startedAt);
+  const elapsed = startedMs > 0 ? formatElapsed(Math.max(0, now - startedMs)) : '—';
   const currentWaveIdx = findCurrentWaveIndex(orch);
   const totalAgents = orch.waves.reduce((sum, w) => sum + w.agents.length, 0);
   const runningAgents = countByStatus(orch, 'running');
   const doneAgents = countByStatus(orch, 'exited');
 
   const statusLabel: Record<string, string> = {
-    running: 'running',
-    complete: 'complete',
-    failed: 'failed',
-    pending: 'queued',
+    running: t('orchestrationPanel.status.running', 'running'),
+    complete: t('orchestrationPanel.status.complete', 'complete'),
+    failed: t('orchestrationPanel.status.failed', 'failed'),
+    pending: t('orchestrationPanel.status.queued', 'queued'),
   };
 
   return (
@@ -41,10 +52,12 @@ export default function OrchestrationPanel() {
       <button
         className="orch-panel__header"
         onClick={() => setCollapsed((c) => !c)}
-        title={collapsed ? 'Expand orchestration' : 'Collapse orchestration'}
+        title={collapsed
+          ? t('orchestrationPanel.expand', 'Expand orchestration')
+          : t('orchestrationPanel.collapse', 'Collapse orchestration')}
       >
         <span className="orch-panel__header-dot" />
-        <span className="orch-panel__header-title">orchestration</span>
+        <span className="orch-panel__header-title">{t('orchestrationPanel.title', 'orchestration')}</span>
         <span className="orch-panel__header-status">{statusLabel[orch.status] || orch.status}</span>
         <span className="orch-panel__header-id">{orch.id.replace(/^orch-/, '')}</span>
       </button>
@@ -78,14 +91,14 @@ export default function OrchestrationPanel() {
           {orch.reviewer && orch.reviewer.status !== 'pending' && (
             <div className="orch-panel__reviewer" data-status={orch.reviewer.status}>
               <span className="orch-panel__reviewer-dot" />
-              <span className="orch-panel__reviewer-label">reviewer</span>
+              <span className="orch-panel__reviewer-label">{t('orchestrationPanel.reviewer', 'reviewer')}</span>
               <span className="orch-panel__reviewer-status">{orch.reviewer.status}</span>
             </div>
           )}
 
           {(orch.status === 'complete' || orch.status === 'failed') && (
             <button className="orch-panel__dismiss" onClick={clear}>
-              dismiss
+              {t('orchestrationPanel.dismiss', 'dismiss')}
             </button>
           )}
         </>
@@ -120,6 +133,7 @@ function WaveBlock({ wave, now }: { wave: OrchestrationWave; now: number }) {
 }
 
 function AgentCard({ agent, now }: { agent: OrchestrationAgent; now: number }) {
+  const t = useT();
   const started = agent.startedAt ? parseIso(agent.startedAt) : 0;
   const finished = agent.finishedAt ? parseIso(agent.finishedAt) : null;
   let durStr = '';
@@ -147,7 +161,7 @@ function AgentCard({ agent, now }: { agent: OrchestrationAgent; now: number }) {
         )}
         {agent.status === 'pending' && (
           <div className="orch-panel__agent-meta">
-            <span className="orch-panel__agent-pending">waiting</span>
+            <span className="orch-panel__agent-pending">{t('orchestrationPanel.waiting', 'waiting')}</span>
           </div>
         )}
       </div>

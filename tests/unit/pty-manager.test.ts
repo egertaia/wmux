@@ -1,18 +1,61 @@
-import { describe, it, expect, afterEach } from 'vitest';
-import { PtyManager } from '../../src/main/pty-manager';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { PtyManager, parseShellSpec, resolveSpawnCwd, resolveShellForCwd, resolveExistingShellPath, comparePackageVersion, shellEnv, shellProbe, resetShellPathCache } from '../../src/main/pty-manager';
+import type { SurfaceId } from '../../src/shared/types';
 
 const TEST_SHELL = 'cmd.exe';
 const TEST_ENV = Object.fromEntries(
   Object.entries(process.env).filter(([, v]) => v !== undefined)
 ) as Record<string, string>;
 
-describe('PtyManager', () => {
+/**
+ * These spawn REAL ConPTY processes, which is the point — the bugs this suite
+ * exists for (#150's crash guard, the double-spawn guard, orphan reaping) all
+ * live in node-pty's actual behaviour rather than in anything mockable.
+ *
+ * The cost is that `pty.spawn()` competes for a shared CI runner, and it is a
+ * synchronous call: when the runner is loaded it can stall well past the 15s
+ * global timeout, failing a test that does nothing but check an id prefix.
+ * That happened to the v1.0.1 tag — with `src/main/pty-manager.ts` byte-identical
+ * to the v1.0.0 that had passed — so the flake blocked a release rather than
+ * catching anything.
+ *
+ * A generous per-suite timeout is the right lever, not a longer global one. It
+ * only ever costs wall-clock on a spawn that was going to fail anyway, and the
+ * global 15s stays tight for the ~1000 tests that touch no processes. The
+ * readiness barrier below still resolves rather than rejects, so a slow runner
+ * degrades into a slower test rather than a hang either way.
+ */
+describe('PtyManager', { timeout: 60_000 }, () => {
   const managers: PtyManager[] = [];
 
   function makeManager(): PtyManager {
     const m = new PtyManager();
     managers.push(m);
     return m;
+  }
+
+  /**
+   * Resolves once the pty has emitted anything, which on Windows is the signal
+   * that node-pty's socket is connected and no longer deferring calls.
+   *
+   * Resolves rather than rejects on timeout: this is a readiness barrier, not
+   * an assertion, and a slow CI runner should not turn into a hang.
+   */
+  function firstData(manager: PtyManager, id: SurfaceId, timeoutMs = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        unsub();
+        resolve();
+      }, timeoutMs);
+      const unsub = manager.onData(id, () => {
+        clearTimeout(timer);
+        unsub();
+        resolve();
+      });
+    });
   }
 
   afterEach(() => {
@@ -69,13 +112,27 @@ describe('PtyManager', () => {
     await new Promise((r) => setTimeout(r, 50));
   });
 
-  it('resize does not throw', () => {
+  it('resize does not throw', async () => {
     const manager = makeManager();
     const { id } = manager.create({
       shell: TEST_SHELL,
       cwd: process.env.USERPROFILE || 'C:\\',
       env: TEST_ENV,
     });
+    // Wait for the pty to actually connect before resizing.
+    //
+    // On Windows, node-pty DEFERS any call made before its socket is up and
+    // replays it on connect. Resizing a just-created pty therefore queued a
+    // resize that afterEach's killAll() outran: the socket connected after the
+    // pty was dead, the replayed resize threw "Cannot resize a pty that has
+    // already exited" from inside node-pty's socket callback, and because that
+    // throw is asynchronous no try/catch here or in PtyManager could ever see
+    // it. Vitest reported it as an unhandled error and failed the whole run —
+    // on CI only, since locally the connect usually won the race.
+    //
+    // Resizing a connected pty is also the thing this test claims to cover;
+    // the old form was accidentally exercising node-pty's deferral queue.
+    await firstData(manager, id);
     expect(() => manager.resize(id, 120, 40)).not.toThrow();
   });
 
@@ -142,3 +199,386 @@ describe('PtyManager', () => {
     expect(manager.has(id2)).toBe(false);
   });
 });
+
+describe('parseShellSpec (issue #78 — shell command lines with args)', () => {
+  it('treats a bare executable as command with no args', () => {
+    expect(parseShellSpec('pwsh.exe')).toEqual({ command: 'pwsh.exe', args: [] });
+  });
+
+  it('returns empty command for undefined/empty specs', () => {
+    expect(parseShellSpec(undefined)).toEqual({ command: '', args: [] });
+    expect(parseShellSpec('   ')).toEqual({ command: '', args: [] });
+  });
+
+  it('splits an ssh command line into command + args', () => {
+    expect(parseShellSpec('ssh user@host')).toEqual({ command: 'ssh', args: ['user@host'] });
+    expect(parseShellSpec('ssh -p 2222 user@host')).toEqual({
+      command: 'ssh',
+      args: ['-p', '2222', 'user@host'],
+    });
+  });
+
+  it('never splits an existing absolute path containing spaces', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux spec '));
+    const exe = path.join(dir, 'my shell.exe');
+    fs.writeFileSync(exe, '');
+    try {
+      expect(parseShellSpec(exe)).toEqual({ command: exe, args: [] });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('honors double quotes around an executable path with spaces', () => {
+    expect(parseShellSpec('"C:\\some path\\tool.exe" --flag')).toEqual({
+      command: 'C:\\some path\\tool.exe',
+      args: ['--flag'],
+    });
+  });
+});
+
+describe('resolveExistingShellPath', () => {
+  it('returns undefined for empty input', () => {
+    expect(resolveExistingShellPath('')).toBeUndefined();
+  });
+
+  it('returns an existing absolute path unchanged', () => {
+    const exe = process.platform === 'win32'
+      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
+      : '/bin/sh';
+    expect(resolveExistingShellPath(exe)).toBe(exe);
+  });
+
+  it('skips WindowsApps aliases and finds a real file for pwsh', () => {
+    if (process.platform !== 'win32') return;
+    const resolved = resolveExistingShellPath('pwsh.exe');
+    expect(resolved).toBeTruthy();
+    expect(fs.existsSync(resolved!)).toBe(true);
+    // Not "the path contains WindowsApps". On a machine where PowerShell 7 is
+    // installed ONLY from the Store — the case this test exists for — the real
+    // exe *is* under that tree, at
+    //   %ProgramFiles%\WindowsApps\Microsoft.PowerShell_<ver>_<arch>__<pub>\pwsh.exe
+    // and findStorePwsh returns exactly that. Excluding the whole tree therefore
+    // failed on the only installation shape that exercises the alias path.
+    //
+    // What must be excluded is the ALIAS, and the package directory is what
+    // tells them apart: the alias is a direct child of an App Execution Alias
+    // dir (%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe), the real exe never
+    // is. Same distinction the pwsh-preview case below draws.
+    expect(path.basename(path.dirname(resolved!)).toLowerCase()).not.toBe('windowsapps');
+  });
+
+  it('resolves pwsh-preview to a real Store pwsh.exe, not the alias', () => {
+    if (process.platform !== 'win32') return;
+    const resolved = resolveExistingShellPath('pwsh-preview');
+    if (!resolved) return; // preview not installed
+    expect(fs.existsSync(resolved)).toBe(true);
+    expect(resolved.toLowerCase()).not.toContain('\\windowsapps\\pwsh-preview');
+    expect(path.basename(resolved).toLowerCase()).toBe('pwsh.exe');
+  });
+});
+
+/**
+ * Issue #176: restoring 26 workspaces took seconds before the sidebar dots went
+ * green. The reporter guessed a serial for-loop over sessions; the restore is
+ * actually a single store update, and the real queue was in the main process.
+ *
+ * resolveExistingShellPath runs on every pane create and shells out to `where`
+ * — measured at ~51ms, about double what pty.spawn itself costs — with no
+ * memoization, and twice on the miss path. 26 panes therefore paid 1.3–2.7s of
+ * *synchronous* main-thread time re-asking the OS an identical question, during
+ * which the pipe server could not service the report_shell_state messages the
+ * dots are waiting on.
+ *
+ * These tests pin the memoization by counting probes rather than timing, so
+ * they mean the same thing on a fast machine and in CI.
+ */
+/**
+ * A machine with Git for Windows installed usually has its `usr\bin` ahead of
+ * System32 on PATH, so a bare `ssh` resolved to Git's MSYS2 build. That build
+ * looks for an agent on $SSH_AUTH_SOCK instead of the Windows named pipe
+ * `\\.\pipe\openssh-ssh-agent`, so on a machine whose keys live only in an
+ * agent (1Password, KeePassXC, the ssh-agent service) it sees no keys at all:
+ * `wmux ssh user@host` died on "Permission denied (publickey)" while the
+ * user's own `ssh` in the same pane worked.
+ *
+ * Only shell SPECS come through here — a command typed at a prompt is resolved
+ * by the shell inside the PTY — so this changes what wmux launches, never what
+ * the user launches.
+ */
+describe('a bare ssh spec resolves to Windows OpenSSH, not PATH', () => {
+  beforeEach(() => {
+    resetShellPathCache();
+    vi.spyOn(shellProbe, 'onPath').mockImplementation(
+      (name: string) => (name === 'ssh' ? 'C:\\Program Files\\Git\\usr\\bin\\ssh.exe' : undefined),
+    );
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetShellPathCache();
+  });
+
+  it('prefers Windows OpenSSH over the PATH hit', () => {
+    if (process.platform !== 'win32') return;
+    const resolved = resolveExistingShellPath('ssh');
+    expect(resolved?.replace(/\\/g, '/')).toMatch(/\/(?:Program Files|System32)\/OpenSSH\/ssh\.exe$/i);
+    expect(resolved).not.toMatch(/Git/i);
+    // The PATH probe must not even be consulted for it.
+    expect(vi.mocked(shellProbe.onPath)).not.toHaveBeenCalledWith('ssh');
+  });
+
+  it('leaves every other shell to PATH', () => {
+    resolveExistingShellPath('fake-shell.exe');
+    expect(vi.mocked(shellProbe.onPath)).toHaveBeenCalledWith('fake-shell.exe');
+  });
+});
+
+describe('shell path resolution is memoized (issue #176)', () => {
+  let probes: string[];
+
+  beforeEach(() => {
+    resetShellPathCache();
+    probes = [];
+    vi.spyOn(shellProbe, 'onPath').mockImplementation((name: string) => {
+      probes.push(name);
+      return name === 'fake-shell.exe' ? FAKE_RESOLVED : undefined;
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetShellPathCache();
+  });
+
+  // A real file, so the cache's existsSync re-validation sees a live hit.
+  const FAKE_RESOLVED = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'cmd.exe')
+    : '/bin/sh';
+
+  it('probes the OS once for 26 identical resolutions', () => {
+    // The issue, as a number: one restore of the reporter's 26 workspaces.
+    for (let i = 0; i < 26; i++) {
+      expect(resolveExistingShellPath('fake-shell.exe')).toBe(FAKE_RESOLVED);
+    }
+    expect(probes).toEqual(['fake-shell.exe']);
+  });
+
+  it('caches misses too, which is the branch that cost double', () => {
+    // A miss runs `where` over the whole PATH before failing, and create()
+    // resolves twice on that path — so an uninstalled or mistyped shell was the
+    // worst case, not the cheapest.
+    for (let i = 0; i < 26; i++) {
+      expect(resolveExistingShellPath('not-installed.exe')).toBeUndefined();
+    }
+    expect(probes).toEqual(['not-installed.exe']);
+  });
+
+  it('keeps separate answers for separate shells', () => {
+    resolveExistingShellPath('fake-shell.exe');
+    resolveExistingShellPath('not-installed.exe');
+    resolveExistingShellPath('fake-shell.exe');
+    resolveExistingShellPath('not-installed.exe');
+    expect(probes).toEqual(['fake-shell.exe', 'not-installed.exe']);
+  });
+
+  it('still returns undefined for empty input without probing', () => {
+    expect(resolveExistingShellPath('')).toBeUndefined();
+    expect(probes).toEqual([]);
+  });
+
+  it('re-probes when a cached hit has been uninstalled', () => {
+    // A stale positive would hand a dead path to pty.spawn, which surfaces as
+    // node-pty's opaque "File not found: " and a pane that dies on open. The
+    // existsSync re-validation is what keeps the cache from causing that.
+    const tmp = path.join(os.tmpdir(), `wmux-shell-cache-${process.pid}.exe`);
+    fs.writeFileSync(tmp, '');
+    try {
+      vi.mocked(shellProbe.onPath).mockImplementation((name: string) => {
+        probes.push(name);
+        return fs.existsSync(tmp) ? tmp : undefined;
+      });
+
+      expect(resolveExistingShellPath('vanishing.exe')).toBe(tmp);
+      expect(probes).toHaveLength(1);
+
+      // Cached, no second probe.
+      expect(resolveExistingShellPath('vanishing.exe')).toBe(tmp);
+      expect(probes).toHaveLength(1);
+
+      // Uninstalled underneath us — the cache must not keep serving it.
+      fs.unlinkSync(tmp);
+      expect(resolveExistingShellPath('vanishing.exe')).toBeUndefined();
+      expect(probes).toHaveLength(2);
+    } finally {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    }
+  });
+
+  it('resetShellPathCache() forces a fresh probe', () => {
+    resolveExistingShellPath('fake-shell.exe');
+    resetShellPathCache();
+    resolveExistingShellPath('fake-shell.exe');
+    expect(probes).toEqual(['fake-shell.exe', 'fake-shell.exe']);
+  });
+});
+
+describe('comparePackageVersion (WindowsApps package ordering)', () => {
+  const STABLE = 'Microsoft.PowerShell_';
+  const PREVIEW = 'Microsoft.PowerShellPreview_';
+  /** A real WindowsApps directory name, version assembled from its components. */
+  const pkg = (prefix: string, version: number[]) => `${prefix}${version.join('.')}_x64__8wekyb3d8bbwe`;
+
+  it('orders newest first', () => {
+    const older = pkg(STABLE, [7, 4, 6, 0]);
+    const newer = pkg(STABLE, [7, 5, 2, 0]);
+    expect([older, newer].sort(comparePackageVersion)[0]).toBe(newer);
+  });
+
+  it('compares numerically, so a two-digit minor beats a one-digit one', () => {
+    // The reason this exists. `.sort().reverse()` is a string sort, and "7.7"
+    // sorts above "7.10" — which would silently pick the older PowerShell the
+    // first time a minor version reaches two digits.
+    const newer = pkg(STABLE, [7, 10, 0, 0]);
+    const older = pkg(STABLE, [7, 7, 1, 0]);
+    expect([newer, older].sort(comparePackageVersion)[0]).toBe(newer);
+    expect([newer, older].sort().reverse()[0]).toBe(older); // what it used to do
+  });
+
+  it('treats a missing or unparseable component as zero rather than NaN', () => {
+    // A NaN anywhere in the comparator makes the sort order undefined, so a
+    // package dir that does not match the expected shape must not poison the
+    // ordering of the ones that do.
+    const full = pkg(STABLE, [7, 5, 0, 0]);
+    const dirs = [full, STABLE, pkg(STABLE, [7, 5])];
+    expect(dirs.sort(comparePackageVersion)[0]).toBe(full);
+  });
+
+  it('keeps the stable and preview package prefixes disjoint', () => {
+    // findStorePwsh filters by prefix, and the two only stay separable because
+    // stable carries the underscore. Dropping it would make every preview
+    // package a candidate for a plain `pwsh` request.
+    expect(pkg(PREVIEW, [7, 7, 0, 1]).startsWith(STABLE)).toBe(false);
+    expect(pkg(STABLE, [7, 5, 2, 0]).startsWith(STABLE)).toBe(true);
+  });
+});
+
+
+/**
+ * CreateProcess fails with error 267 (ERROR_DIRECTORY) when handed a working
+ * dir that isn't a real directory, and node-pty surfaces it as an opaque
+ * "Failed to create terminal: Cannot create process, error code: 267" — the
+ * pane just dies. The cwd comes from session state / CLI args (e.g. an agent
+ * spawned into a git worktree that was deleted after its wave, or ordered
+ * before `git worktree add` finished), so it cannot be trusted to still exist.
+ */
+describe('resolveSpawnCwd', () => {
+  const home = process.env.USERPROFILE || 'C:\\';
+
+  it('keeps a cwd that exists', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-cwd-'));
+    try {
+      expect(resolveSpawnCwd(dir)).toBe(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back when the cwd was deleted (the worktree case → error 267)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-cwd-'));
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect(resolveSpawnCwd(dir)).toBe(home);
+  });
+
+  it('falls back when the cwd never existed', () => {
+    expect(resolveSpawnCwd('C:\\definitely\\not\\here\\wmux-test')).toBe(home);
+  });
+
+  it('falls back when the cwd is a file, not a directory', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-cwd-'));
+    const file = path.join(dir, 'not-a-dir.txt');
+    fs.writeFileSync(file, 'x');
+    try {
+      expect(resolveSpawnCwd(file)).toBe(home);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back for a POSIX/WSL cwd (issue #60)', () => {
+    expect(resolveSpawnCwd('/home/user/project')).toBe(home);
+  });
+
+  // Deliberately NOT node-pty's default any more (#214). Its default is "inherit
+  // the parent process's cwd", and wmux's own cwd is whatever the launcher gave
+  // it — C:\Windows\system32 for a Start-menu launch or an OS crash relaunch.
+  it('falls back for no cwd, rather than inheriting wmux\'s own (issue #214)', () => {
+    expect(resolveSpawnCwd(undefined)).toBe(home);
+  });
+});
+/**
+ * resolveSpawnCwd above is the honest Win32 answer — %USERPROFILE% — but it is
+ * also why a new tab in a WSL/devcontainer workspace silently opened in the
+ * Windows home folder instead of the project. A UNC working directory is not an
+ * option (CreateProcess rejects it), so the fix is to pick the one shell that
+ * can actually reach the path.
+ */
+describe('resolveShellForCwd (POSIX cwd → WSL shell)', () => {
+  const POSIX = '/home/user/agent/project';
+
+  beforeEach(() => {
+    vi.spyOn(shellEnv, 'isWindows').mockReturnValue(true);
+    vi.spyOn(shellEnv, 'hasWsl').mockReturnValue(true);
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('swaps a Win32 shell for wsl.exe when the cwd is POSIX', () => {
+    expect(resolveShellForCwd('pwsh.exe', POSIX)).toBe('wsl.exe');
+    expect(resolveShellForCwd('powershell.exe', POSIX)).toBe('wsl.exe');
+    expect(resolveShellForCwd('cmd.exe', POSIX)).toBe('wsl.exe');
+  });
+
+  it('leaves a Win32 cwd alone', () => {
+    expect(resolveShellForCwd('pwsh.exe', 'C:\\work\\project')).toBe('pwsh.exe');
+    expect(resolveShellForCwd('pwsh.exe', undefined)).toBe('pwsh.exe');
+  });
+
+  it('leaves a shell that is already WSL alone', () => {
+    expect(resolveShellForCwd('wsl.exe', POSIX)).toBe('wsl.exe');
+  });
+
+  it('does not hijack a deliberate remote command line (issue #78)', () => {
+    // `wmux ssh user@host` resolves to a shell wmux cannot classify. Replacing
+    // it with wsl.exe would drop the user somewhere else entirely, which is a
+    // worse failure than opening in the wrong directory.
+    expect(resolveShellForCwd('ssh', POSIX)).toBe('ssh');
+  });
+
+  it('keeps today\'s behaviour when WSL is not installed', () => {
+    vi.spyOn(shellEnv, 'hasWsl').mockReturnValue(false);
+    expect(resolveShellForCwd('pwsh.exe', POSIX)).toBe('pwsh.exe');
+  });
+
+  it('is a no-op off Windows', () => {
+    vi.spyOn(shellEnv, 'isWindows').mockReturnValue(false);
+    expect(resolveShellForCwd('/bin/bash', POSIX)).toBe('/bin/bash');
+  });
+
+  it('classifies an absolute shell by its basename, not by its directories', () => {
+    // #172 changed resolveShell to return the resolved absolute path rather
+    // than the bare name it was handed, which put every parent directory into
+    // the substring match. These are real install layouts: Cmder ships bash
+    // under a "cmder" directory, and a path can contain "wsl" or "pwsh" for
+    // reasons that have nothing to do with the executable at the end of it.
+    expect(resolveShellForCwd('C:\\tools\\cmder\\bin\\bash.exe', POSIX)).toBe('C:\\tools\\cmder\\bin\\bash.exe');
+    expect(resolveShellForCwd('C:\\Users\\wsl-admin\\bin\\bash.exe', POSIX)).toBe('C:\\Users\\wsl-admin\\bin\\bash.exe');
+  });
+
+  it('still classifies a real absolute PowerShell path', () => {
+    // The flip side: narrowing to the basename must not stop recognising the
+    // absolute pwsh path resolveShell now actually returns.
+    expect(resolveShellForCwd('C:\\Program Files\\PowerShell\\7\\pwsh.exe', POSIX)).toBe('wsl.exe');
+    expect(resolveShellForCwd('C:\\Windows\\System32\\cmd.exe', POSIX)).toBe('wsl.exe');
+  });
+});
+

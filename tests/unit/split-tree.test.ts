@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createLeaf, splitNode, removeLeaf, findLeaf, updateRatio, getAllPaneIds, buildGridLayout } from '../../src/renderer/store/split-utils';
+import { createLeaf, splitNode, removeLeaf, findLeaf, updateRatio, getAllPaneIds, buildGridLayout, replaceSoleTerminalSurface, freezeSurfaceCwds, instantiateLayout, buildDefaultSplitTree, patchLeafPrimarySurface, mergeStartupCommands, dropEphemeralSurfaces } from '../../src/renderer/store/split-utils';
 
 describe('split-tree', () => {
   it('creates a leaf node', () => {
@@ -151,5 +151,388 @@ describe('buildGridLayout', () => {
     for (const pid of result.newPaneIds) {
       expect(findLeaf(result.tree, pid)).toBeDefined();
     }
+  });
+});
+
+describe('replaceSoleTerminalSurface (agent spawn --replace-tab)', () => {
+  const agentSurface = { id: 'surf-agent' as any, type: 'terminal' as const };
+
+  it('replaces a sole terminal surface and reports the replaced id', () => {
+    let tree: any = createLeaf('pane-1' as any, 'terminal');
+    tree = splitNode(tree, 'pane-1' as any, 'pane-2' as any, 'terminal', 'horizontal');
+    const defaultSurfaceId = findLeaf(tree, 'pane-2' as any)!.surfaces[0].id;
+
+    const result = replaceSoleTerminalSurface(tree, 'pane-2' as any, agentSurface);
+    expect(result.replacedSurfaceId).toBe(defaultSurfaceId);
+
+    const leaf = findLeaf(result.tree, 'pane-2' as any)!;
+    expect(leaf.surfaces.length).toBe(1);
+    expect(leaf.surfaces[0].id).toBe('surf-agent');
+    expect(leaf.activeSurfaceIndex).toBe(0);
+    // Other panes untouched
+    expect(findLeaf(result.tree, 'pane-1' as any)!.surfaces[0].id)
+      .toBe(findLeaf(tree, 'pane-1' as any)!.surfaces[0].id);
+  });
+
+  it('refuses when the leaf has more than one surface', () => {
+    const leaf = createLeaf('pane-1' as any, 'terminal');
+    const tree: any = {
+      ...leaf,
+      surfaces: [...leaf.surfaces, { id: 'surf-user' as any, type: 'terminal' as const }],
+    };
+    const result = replaceSoleTerminalSurface(tree, 'pane-1' as any, agentSurface);
+    expect(result.replacedSurfaceId).toBeNull();
+    expect(result.tree).toBe(tree);
+  });
+
+  it('refuses when the sole surface is not a terminal', () => {
+    const tree = createLeaf('pane-1' as any, 'browser');
+    const result = replaceSoleTerminalSurface(tree, 'pane-1' as any, agentSurface);
+    expect(result.replacedSurfaceId).toBeNull();
+    expect(result.tree).toBe(tree);
+  });
+
+  it('is a no-op for an unknown paneId', () => {
+    const tree = createLeaf('pane-1' as any, 'terminal');
+    const result = replaceSoleTerminalSurface(tree, 'pane-nope' as any, agentSurface);
+    expect(result.replacedSurfaceId).toBeNull();
+    expect(result.tree).toBe(tree);
+  });
+
+  it('works on a leaf nested inside branches (grid pane)', () => {
+    const base = createLeaf('pane-1' as any, 'terminal');
+    const grid = buildGridLayout(base, 'pane-1' as any, 4);
+    const target = grid.newPaneIds[2];
+    const result = replaceSoleTerminalSurface(grid.tree, target, agentSurface);
+    expect(result.replacedSurfaceId).not.toBeNull();
+    expect(findLeaf(result.tree, target)!.surfaces[0].id).toBe('surf-agent');
+    // Anchor untouched
+    expect(findLeaf(result.tree, 'pane-1' as any)!.surfaces[0].id)
+      .toBe(base.surfaces[0].id);
+  });
+});
+
+// ─── freezeSurfaceCwds (issue #134) ──────────────────────────────────────────
+// A saved session used to persist only the workspace-level cwd, so restoring a
+// window whose terminals sat on different drives sent all of them to the same
+// place — for the reporter, worktrees on D:\ came back on C:\.
+describe('freezeSurfaceCwds', () => {
+  const leafWith = (paneId: string, surfaces: any[]) => ({
+    type: 'leaf' as const,
+    paneId: paneId as any,
+    surfaces,
+    activeSurfaceIndex: 0,
+  });
+
+  it('promotes the live directory into the spawn directory', () => {
+    const tree = leafWith('pane-1', [
+      { id: 'surf-1', type: 'terminal', currentCwd: 'D:\worktrees\feature-a' },
+    ]);
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.surfaces[0].cwd).toBe('D:\worktrees\feature-a');
+  });
+
+  it('keeps each pane on its own drive instead of collapsing to one', () => {
+    const tree = {
+      type: 'branch' as const,
+      direction: 'horizontal' as const,
+      ratio: 0.5,
+      children: [
+        leafWith('pane-1', [{ id: 'surf-1', type: 'terminal', currentCwd: 'D:\wt\a' }]),
+        leafWith('pane-2', [{ id: 'surf-2', type: 'terminal', currentCwd: 'E:\wt\b' }]),
+      ],
+    };
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.children[0].surfaces[0].cwd).toBe('D:\wt\a');
+    expect(frozen.children[1].surfaces[0].cwd).toBe('E:\wt\b');
+  });
+
+  it('freezes every tab in a pane, not just the visible one', () => {
+    const tree = leafWith('pane-1', [
+      { id: 'surf-1', type: 'terminal', currentCwd: 'D:\one' },
+      { id: 'surf-2', type: 'terminal', currentCwd: 'D:\two' },
+    ]);
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.surfaces.map((s: any) => s.cwd)).toEqual(['D:\one', 'D:\two']);
+  });
+
+  it('overwrites a stale spawn directory the terminal has since left', () => {
+    const tree = leafWith('pane-1', [
+      { id: 'surf-1', type: 'terminal', cwd: 'C:\start', currentCwd: 'D:\moved-here' },
+    ]);
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.surfaces[0].cwd).toBe('D:\moved-here');
+  });
+
+  it('leaves a surface that never reported a directory exactly as it was', () => {
+    // No shell integration (or a browser/markdown tab) — the workspace-level
+    // fallback still applies on restore, which is the pre-#134 behaviour.
+    const surface = { id: 'surf-1', type: 'terminal', cwd: 'C:\explicit' };
+    const tree = leafWith('pane-1', [surface]);
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.surfaces[0]).toBe(surface);
+  });
+
+  it('does not mutate the live tree — the store keeps its spawn arguments', () => {
+    const tree = leafWith('pane-1', [
+      { id: 'surf-1', type: 'terminal', cwd: 'C:\start', currentCwd: 'D:\moved-here' },
+    ]);
+    freezeSurfaceCwds(tree);
+    expect(tree.surfaces[0].cwd).toBe('C:\start');
+  });
+
+  it('carries currentCwd through so a restored tab can label itself immediately', () => {
+    const tree = leafWith('pane-1', [{ id: 'surf-1', type: 'terminal', currentCwd: 'D:\wt\a' }]);
+    const frozen = freezeSurfaceCwds(tree) as any;
+    expect(frozen.surfaces[0].currentCwd).toBe('D:\wt\a');
+  });
+});
+
+// ─── buildDefaultSplitTree (sidebar "+" / first-launch factory layout) ───────
+// Distinct from createLeaf()'s single-pane baseline used by Ctrl+N/CLI — the
+// two are deliberately different defaults, not unified (see the doc comment
+// on resolveDefaultSplitTree in workspace-slice.ts).
+describe('buildDefaultSplitTree', () => {
+  it('builds a 3-pane layout: two panes on top, one below', () => {
+    const tree = buildDefaultSplitTree();
+    expect(tree.type).toBe('branch');
+    expect(getAllPaneIds(tree)).toHaveLength(3);
+    if (tree.type !== 'branch') return;
+    expect(tree.direction).toBe('vertical');
+    const [top, bottom] = tree.children;
+    expect(top.type).toBe('branch');
+    expect(bottom.type).toBe('leaf');
+    if (top.type === 'branch') expect(top.direction).toBe('horizontal');
+  });
+
+  it('mints fresh ids on every call', () => {
+    const a = buildDefaultSplitTree();
+    const b = buildDefaultSplitTree();
+    const aIds = getAllPaneIds(a);
+    const bIds = getAllPaneIds(b);
+    expect(aIds.some((id) => bIds.includes(id))).toBe(false);
+  });
+});
+
+// ─── patchLeafPrimarySurface (saved-layout pane editing) ─────────────────────
+describe('patchLeafPrimarySurface', () => {
+  it('patches the first surface of the target leaf, leaving others untouched', () => {
+    let tree: any = createLeaf('pane-1' as any, 'terminal');
+    tree = splitNode(tree, 'pane-1' as any, 'pane-2' as any, 'terminal', 'horizontal');
+
+    const patched = patchLeafPrimarySurface(tree, 'pane-2' as any, { startupCommands: ['claude'] });
+    const pane1 = findLeaf(patched, 'pane-1' as any)!;
+    const pane2 = findLeaf(patched, 'pane-2' as any)!;
+    expect(pane2.surfaces[0].startupCommands).toEqual(['claude']);
+    expect(pane1.surfaces[0].startupCommands).toBeUndefined();
+  });
+
+  it('is a no-op for an unknown paneId', () => {
+    const tree = createLeaf('pane-1' as any, 'terminal');
+    const result = patchLeafPrimarySurface(tree, 'pane-nope' as any, { startupCommands: ['x'] });
+    expect(result).toBe(tree);
+  });
+});
+
+// ─── mergeStartupCommands (Overwrite must not clobber manual pane edits) ─────
+describe('mergeStartupCommands', () => {
+  it('carries forward an old startupCommands the new capture lacks', () => {
+    const oldTree = patchLeafPrimarySurface(createLeaf('pane-1' as any, 'terminal'), 'pane-1' as any, {
+      startupCommands: ['claude'],
+    });
+    const newTree = createLeaf('pane-2' as any, 'terminal'); // fresh capture, no commands, new pane id
+
+    const merged = mergeStartupCommands(newTree, oldTree) as any;
+    expect(merged.surfaces[0].startupCommands).toEqual(['claude']);
+    expect(merged.paneId).toBe('pane-2'); // geometry/ids come from the NEW capture
+  });
+
+  it('lets the live capture win when it already has its own startupCommands', () => {
+    const oldTree = patchLeafPrimarySurface(createLeaf('pane-1' as any, 'terminal'), 'pane-1' as any, {
+      startupCommands: ['stale'],
+    });
+    const newTree = patchLeafPrimarySurface(createLeaf('pane-2' as any, 'terminal'), 'pane-2' as any, {
+      startupCommands: ['fresh'],
+    });
+
+    const merged = mergeStartupCommands(newTree, oldTree) as any;
+    expect(merged.surfaces[0].startupCommands).toEqual(['fresh']);
+  });
+
+  it('matches by position, not id, across a differently-shaped new capture', () => {
+    let oldTree: any = createLeaf('pane-1' as any, 'terminal');
+    oldTree = patchLeafPrimarySurface(oldTree, 'pane-1' as any, { startupCommands: ['claude'] });
+    let newTree: any = createLeaf('pane-a' as any, 'terminal');
+    newTree = splitNode(newTree, 'pane-a' as any, 'pane-b' as any, 'terminal', 'horizontal');
+
+    const merged = mergeStartupCommands(newTree, oldTree) as any;
+    // Old had exactly one pane at index 0 — only the new tree's first pane inherits it.
+    const firstLeaf = findLeaf(merged, 'pane-a' as any)!;
+    const secondLeaf = findLeaf(merged, 'pane-b' as any)!;
+    expect(firstLeaf.surfaces[0].startupCommands).toEqual(['claude']);
+    expect(secondLeaf.surfaces[0].startupCommands ?? []).toEqual([]);
+  });
+});
+
+// ─── instantiateLayout (saved default/preset layouts) ────────────────────────
+// A saved layout is applied to more than one new workspace over its lifetime,
+// so every application must mint fresh pane/surface ids — reusing them would
+// break the PTY-id === surface-id re-attach invariant the moment a second
+// workspace shared an id with the first.
+describe('instantiateLayout', () => {
+  it('mints fresh pane and surface ids while preserving structure', () => {
+    let template: any = createLeaf('pane-tpl' as any, 'terminal');
+    template = splitNode(template, 'pane-tpl' as any, 'pane-tpl-2' as any, 'terminal', 'vertical');
+
+    const result = instantiateLayout(template);
+    expect(result.type).toBe('branch');
+    if (result.type !== 'branch') return;
+    expect(result.direction).toBe('vertical');
+    expect(result.ratio).toBe(0.5);
+
+    const newIds = getAllPaneIds(result);
+    expect(newIds.length).toBe(2);
+    expect(newIds).not.toContain('pane-tpl');
+    expect(newIds).not.toContain('pane-tpl-2');
+  });
+
+  it('preserves shell/cwd/startupCommands on each surface', () => {
+    const template = createLeaf('pane-tpl' as any, 'terminal') as any;
+    template.surfaces[0] = { ...template.surfaces[0], shell: 'pwsh.exe', cwd: 'C:\\proj', startupCommands: ['npm run dev'] };
+
+    const result = instantiateLayout(template) as any;
+    expect(result.surfaces[0].id).not.toBe(template.surfaces[0].id);
+    expect(result.surfaces[0].shell).toBe('pwsh.exe');
+    expect(result.surfaces[0].cwd).toBe('C:\\proj');
+    expect(result.surfaces[0].startupCommands).toEqual(['npm run dev']);
+  });
+
+  it('produces distinct ids on repeated calls against the same template', () => {
+    const template = createLeaf('pane-tpl' as any, 'terminal');
+    const a = instantiateLayout(template) as any;
+    const b = instantiateLayout(template) as any;
+    expect(a.paneId).not.toBe(b.paneId);
+    expect(a.surfaces[0].id).not.toBe(b.surfaces[0].id);
+  });
+
+  // A `code` surface is the one surface that REFERS to another surface's id.
+  // Minting a fresh id for the terminal while leaving the reference pointing at
+  // the old one is not a cosmetic mismatch: CodePane reads through that id, and
+  // main answers only for a live owned surface, so the tab comes back blank in
+  // every workspace ever made from the layout.
+  it('remaps a code tab root to the terminal it was minted alongside', () => {
+    const template = createLeaf('pane-tpl' as any, 'terminal') as any;
+    const terminalId = template.surfaces[0].id;
+    template.surfaces.push({
+      id: 'surf-code-tpl',
+      type: 'code',
+      title: 'main.ts',
+      codeRelPath: 'src/main.ts',
+      codeFilePath: 'C:\\proj\\src\\main.ts',
+      codeRootSurfaceId: terminalId,
+    });
+
+    const result = instantiateLayout(template) as any;
+    const [terminal, code] = result.surfaces;
+    expect(terminal.id).not.toBe(terminalId);
+    expect(code.id).not.toBe('surf-code-tpl');
+    expect(code.codeRootSurfaceId).toBe(terminal.id);
+    // The path fields are what the tab re-reads from — they must survive.
+    expect(code.codeRelPath).toBe('src/main.ts');
+    expect(code.codeFilePath).toBe('C:\\proj\\src\\main.ts');
+  });
+
+  it('resolves a code tab root that lives in a different pane of the template', () => {
+    let template: any = createLeaf('pane-a' as any, 'terminal');
+    template = splitNode(template, 'pane-a' as any, 'pane-b' as any, 'terminal', 'vertical');
+    const terminalId = template.children[0].surfaces[0].id;
+    template.children[1].surfaces.push({
+      id: 'surf-code-tpl',
+      type: 'code',
+      title: 'main.ts',
+      codeRelPath: 'src/main.ts',
+      codeRootSurfaceId: terminalId,
+    });
+
+    const result = instantiateLayout(template) as any;
+    const newTerminalId = result.children[0].surfaces[0].id;
+    const code = result.children[1].surfaces[1];
+    expect(newTerminalId).not.toBe(terminalId);
+    expect(code.codeRootSurfaceId).toBe(newTerminalId);
+  });
+
+  it('drops a code tab root the template never contained', () => {
+    const template = createLeaf('pane-tpl' as any, 'terminal') as any;
+    template.surfaces.push({
+      id: 'surf-code-tpl',
+      type: 'code',
+      title: 'main.ts',
+      codeRelPath: 'src/main.ts',
+      codeRootSurfaceId: 'surf-from-another-workspace',
+    });
+
+    const result = instantiateLayout(template) as any;
+    const code = result.surfaces[1];
+    // Absent, not carried through as a dead id: CodePane reports invalid_path
+    // rather than reading against a surface that was never in this tree.
+    expect('codeRootSurfaceId' in code).toBe(false);
+    expect(code.codeRootSurfaceId).toBeUndefined();
+  });
+});
+
+describe('dropEphemeralSurfaces', () => {
+  const leaf = (surfaces: any[]): any => ({
+    type: 'leaf', paneId: 'pane-1', surfaces, activeSurfaceIndex: surfaces.length - 1,
+  });
+
+  it('removes a clean ephemeral surface', () => {
+    const out: any = dropEphemeralSurfaces(leaf([
+      { id: 'surf-1', type: 'terminal' },
+      { id: 'surf-2', type: 'markdown', ephemeral: true },
+    ]));
+    expect(out.surfaces.map((s: any) => s.id)).toEqual(['surf-1']);
+    expect(out.activeSurfaceIndex).toBe(0);
+  });
+
+  it('keeps a DIRTY ephemeral surface but strips the flag', () => {
+    const out: any = dropEphemeralSurfaces(leaf([
+      { id: 'surf-1', type: 'markdown', ephemeral: true, markdownDirty: true, markdownContent: 'edited' },
+    ]));
+    expect(out.surfaces).toHaveLength(1);
+    expect(out.surfaces[0].ephemeral).toBeUndefined();
+    expect(out.surfaces[0].markdownDirty).toBe(true);
+    expect(out.surfaces[0].markdownContent).toBe('edited');
+  });
+
+  it('promotes a sole ephemeral surface instead of leaving an empty leaf', () => {
+    const out: any = dropEphemeralSurfaces(leaf([
+      { id: 'surf-1', type: 'markdown', ephemeral: true },
+    ]));
+    expect(out.surfaces).toHaveLength(1);
+    expect(out.surfaces[0].id).toBe('surf-1');
+    expect(out.surfaces[0].ephemeral).toBeFalsy();
+  });
+
+  it('still drops the ephemeral surface when a normal one remains', () => {
+    const out: any = dropEphemeralSurfaces(leaf([
+      { id: 'surf-1', type: 'terminal' },
+      { id: 'surf-2', type: 'markdown', ephemeral: true },
+    ]));
+    expect(out.surfaces.map((s: any) => s.id)).toEqual(['surf-1']);
+  });
+
+  it('recurses into split nodes', () => {
+    const out: any = dropEphemeralSurfaces({
+      type: 'split', direction: 'horizontal', ratio: 0.5,
+      children: [
+        // Two surfaces here (not one) so this exercises the ordinary drop
+        // rather than the sole-ephemeral promotion case, which has its own
+        // dedicated tests above.
+        leaf([{ id: 'a', type: 'terminal' }, { id: 'a2', type: 'markdown', ephemeral: true }]),
+        leaf([{ id: 'b', type: 'terminal' }]),
+      ],
+    } as any);
+    expect(out.children[0].surfaces).toHaveLength(1);
+    expect(out.children[1].surfaces).toHaveLength(1);
   });
 });

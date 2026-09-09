@@ -1,42 +1,20 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-
-const START_MARKER = '<!-- wmux:start';
-const END_MARKER = '<!-- wmux:end -->';
+import { stripWmuxBlock, stripLegacyBlocks } from './claude-context';
+import { injectWmuxBlock as spliceBlock, readRenderedInstructions } from './agent-instructions';
 
 /**
  * Pure: insert/replace the wmux block within existing content, preserving the rest.
- * Trailing whitespace on the block is normalized away so re-applying is idempotent
- * even when the instructions source ends with a newline (otherwise the trailing
- * newline accumulates on every run).
+ *
+ * Thin wrapper over the shared splice in agent-instructions.ts, kept as a named
+ * export because the existing tests target it here. The implementation moved
+ * when omp became the third agent needing it (#165) — and the copy written for
+ * omp had already lost the `trimEnd()` this one depends on, appending one blank
+ * line per launch to a file the agent reads every session.
  */
-export function injectWmuxBlock(existing: string, wmuxBlock: string): string {
-  const block = wmuxBlock.trimEnd();
-  if (existing.trim() === '') return block;
-  const startIdx = existing.indexOf(START_MARKER);
-  const endIdx = existing.indexOf(END_MARKER);
-  if (startIdx === -1) {
-    const separator = existing.endsWith('\n') ? '\n' : '\n\n';
-    return existing + separator + block;
-  }
-  if (endIdx === -1) {
-    return existing.substring(0, startIdx) + block;
-  }
-  const before = existing.substring(0, startIdx);
-  const after = existing.substring(endIdx + END_MARKER.length);
-  return before + block + after;
-}
-
-function getInstructionsPath(): string {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { app } = require('electron') as typeof import('electron');
-    if (app.isPackaged) {
-      return path.join(process.resourcesPath, 'claude-instructions', 'claude-instructions.md');
-    }
-  } catch { /* not running under Electron */ }
-  return path.join(__dirname, '../../resources/claude-instructions.md');
+export function injectWmuxBlock(rawExisting: string, wmuxBlock: string): string {
+  return spliceBlock(rawExisting, wmuxBlock, stripLegacyBlocks);
 }
 
 function getAgentsMdPath(): string {
@@ -46,12 +24,9 @@ function getAgentsMdPath(): string {
 /** Ensures ~/.config/opencode/AGENTS.md contains the wmux block. */
 export function ensureOpencodeContext(): void {
   try {
-    const instructionsPath = getInstructionsPath();
-    if (!fs.existsSync(instructionsPath)) {
-      console.warn('[wmux] instructions source not found at', instructionsPath);
-      return;
-    }
-    const wmuxBlock = fs.readFileSync(instructionsPath, 'utf-8');
+    // Rendered, not read: carries this install's absolute CLI path (#158).
+    const wmuxBlock = readRenderedInstructions();
+    if (wmuxBlock === null) return;
     const agentsPath = getAgentsMdPath();
     const dir = path.dirname(agentsPath);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -106,5 +81,46 @@ export function ensureOpencodePlugin(): void {
     console.log('[wmux] Installed wmux OpenCode plugin to', dest);
   } catch (err) {
     console.warn('[wmux] Failed to install OpenCode plugin:', err);
+  }
+}
+
+/**
+ * Delete wmux's block from ~/.config/opencode/AGENTS.md (issue #132).
+ *
+ * Mirrors removeClaudeContext: the file goes only when it held nothing but our
+ * block, so an AGENTS.md the user wrote survives with just the block excised.
+ * The stripping itself is shared — the two files use identical markers, and
+ * having one implementation is what stops the two paths from drifting.
+ */
+export function removeOpencodeContext(): void {
+  try {
+    const agentsPath = getAgentsMdPath();
+    if (!fs.existsSync(agentsPath)) return;
+    const stripped = stripWmuxBlock(fs.readFileSync(agentsPath, 'utf-8'));
+    if (stripped === null) return;
+    if (stripped === '') fs.unlinkSync(agentsPath);
+    else fs.writeFileSync(agentsPath, stripped, 'utf-8');
+    console.log('[wmux] Removed wmux context from ~/.config/opencode/AGENTS.md');
+  } catch (err) {
+    console.warn('[wmux] Failed to remove OpenCode context:', err);
+  }
+}
+
+/**
+ * Remove the wmux OpenCode plugin (issue #132).
+ *
+ * Guarded on the version marker wmux stamps into its own plugin source: a
+ * wmux.js the user wrote or vendored themselves has no marker and is left where
+ * it is, because uninstalling our integration must not delete their file.
+ */
+export function removeOpencodePlugin(): void {
+  try {
+    const dest = path.join(os.homedir(), '.config', 'opencode', 'plugin', 'wmux.js');
+    if (!fs.existsSync(dest)) return;
+    if (!VERSION_RE.test(fs.readFileSync(dest, 'utf-8'))) return;
+    fs.unlinkSync(dest);
+    console.log('[wmux] Removed the wmux OpenCode plugin from', dest);
+  } catch (err) {
+    console.warn('[wmux] Failed to remove OpenCode plugin:', err);
   }
 }

@@ -1,56 +1,37 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { useStore } from '../../store';
-import { ShortcutAction, ShortcutBinding } from '../../store/settings-slice';
-import { ACTION_LABELS } from '../Settings/KeyboardSettings';
+import { useT } from '../../i18n';
+import type { TranslationKey } from '../../i18n';
+import { KeyboardPrefs, ShortcutAction, ShortcutBinding } from '../../store/settings-slice';
+import { formatIndexShortcut } from '../../utils/index-shortcuts';
+import { actionLabel, formatBinding, CATEGORY, CATEGORY_ORDER, CATEGORY_LABEL_KEY } from '../Settings/KeyboardSettings';
 import '../../styles/cheat-sheet.css';
 
 interface ShortcutCheatSheetProps {
   onClose: () => void;
 }
 
-// Render a binding as "Ctrl+Shift+T". Matches CommandPalette.formatBinding so the
-// cheat-sheet always shows the user's live (possibly remapped) bindings.
-function formatBinding(binding: ShortcutBinding): string {
-  const parts: string[] = [];
-  if (binding.ctrl) parts.push('Ctrl');
-  if (binding.alt) parts.push('Alt');
-  if (binding.shift) parts.push('Shift');
-  parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key);
-  return parts.join('+');
+// The number-row families (issue #202). They aren't ShortcutActions — each is
+// one modifier choice covering nine keys — so they're built here rather than
+// coming out of `shortcuts`. Read live from keyboardPrefs so a remap shows up
+// on F1, and dropped entirely when the user has switched a family off.
+function getIndexBindings(
+  keyboardPrefs: KeyboardPrefs,
+  t: (key: TranslationKey, fallback?: string) => string,
+): Array<{ label: string; binding: string; category: string }> {
+  const rows: Array<{ label: string; binding: string; category: string }> = [];
+  const workspace = formatIndexShortcut(keyboardPrefs.workspaceIndexModifiers);
+  if (workspace) rows.push({ label: t('cheatSheet.selectWorkspace', 'Select workspace 1–9'), binding: workspace, category: 'Workspaces' });
+  const surface = formatIndexShortcut(keyboardPrefs.surfaceIndexModifiers);
+  if (surface) rows.push({ label: t('cheatSheet.selectTab', 'Select tab 1–9'), binding: surface, category: 'Tabs' });
+  return rows;
 }
 
-// Group every action under a readable category. Actions absent here fall under
-// "Other", so newly-added shortcuts still appear without touching this map.
-const CATEGORY: Partial<Record<ShortcutAction, string>> = {
-  newWorkspace: 'Workspaces', closeWorkspace: 'Workspaces', nextWorkspace: 'Workspaces',
-  prevWorkspace: 'Workspaces', renameWorkspace: 'Workspaces', jumpToUnread: 'Workspaces',
-  togglePinWorkspace: 'Workspaces', markWorkspaceRead: 'Workspaces', openFolder: 'Workspaces',
-  newWindow: 'Workspaces', closeWindow: 'Workspaces',
-  newSurface: 'Tabs', nextSurface: 'Tabs', prevSurface: 'Tabs', reopenClosedSurface: 'Tabs',
-  renameSurface: 'Tabs', openMarkdownPanel: 'Tabs',
-  splitRight: 'Panes', splitDown: 'Panes', splitBrowserRight: 'Panes', splitBrowserDown: 'Panes',
-  focusLeft: 'Panes', focusRight: 'Panes', focusUp: 'Panes', focusDown: 'Panes',
-  resizePaneLeft: 'Panes', resizePaneRight: 'Panes', resizePaneUp: 'Panes', resizePaneDown: 'Panes',
-  toggleZoom: 'Panes', closeSurfaceOrPane: 'Panes', broadcastInput: 'Panes',
-  find: 'Terminal', findNext: 'Terminal', findPrevious: 'Terminal', copyMode: 'Terminal',
-  copy: 'Terminal', paste: 'Terminal', fontSizeIncrease: 'Terminal', fontSizeDecrease: 'Terminal',
-  fontSizeReset: 'Terminal',
-  toggleSidebar: 'View', showNotifications: 'View', flashFocused: 'View', openBrowser: 'View',
-  browserDevTools: 'View', browserConsole: 'View', openSettings: 'View', commandPalette: 'View',
-  toggleShortcutCheatSheet: 'View',
-};
-
-const CATEGORY_ORDER = ['Workspaces', 'Tabs', 'Panes', 'Terminal', 'View', 'Other'];
-
-// Fixed (non-remappable) bindings handled by dedicated key listeners, surfaced
-// here so they're discoverable alongside the remappable ones.
-const FIXED_BINDINGS: Array<{ label: string; binding: string; category: string }> = [
-  { label: 'Select workspace 1–9', binding: 'Ctrl+1…9', category: 'Workspaces' },
-  { label: 'Select tab 1–9', binding: 'Ctrl+Alt+1…9', category: 'Tabs' },
-];
-
 export default function ShortcutCheatSheet({ onClose }: ShortcutCheatSheetProps) {
+  const t = useT();
   const shortcuts = useStore((s) => s.shortcuts);
+  const keyboardPrefs = useStore((s) => s.keyboardPrefs);
+  const hubEnabled = useStore((s) => s.appearancePrefs.hubEnabled);
   const [query, setQuery] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -64,12 +45,16 @@ export default function ShortcutCheatSheet({ onClose }: ShortcutCheatSheetProps)
 
   const grouped = useMemo(() => {
     const rows: Array<{ label: string; binding: string; category: string }> = [
-      ...(Object.entries(shortcuts) as [ShortcutAction, ShortcutBinding][]).map(([action, binding]) => ({
-        label: ACTION_LABELS[action] ?? action,
-        binding: formatBinding(binding),
-        category: CATEGORY[action] ?? 'Other',
-      })),
-      ...FIXED_BINDINGS,
+      ...(Object.entries(shortcuts) as [ShortcutAction, ShortcutBinding][])
+        // The agent-office easter egg stays a secret (and its binding is inert)
+        // until the Settings toggle enables it.
+        .filter(([action]) => action !== 'openHub' || hubEnabled)
+        .map(([action, binding]) => ({
+          label: actionLabel(action, t),
+          binding: formatBinding(binding),
+          category: CATEGORY[action] ?? 'Other',
+        })),
+      ...getIndexBindings(keyboardPrefs, t),
     ];
     const q = query.trim().toLowerCase();
     const filtered = q
@@ -84,29 +69,29 @@ export default function ShortcutCheatSheet({ onClose }: ShortcutCheatSheetProps)
     return CATEGORY_ORDER
       .filter((c) => byCategory.has(c))
       .map((c) => ({ category: c, rows: byCategory.get(c)!.sort((a, b) => a.label.localeCompare(b.label)) }));
-  }, [shortcuts, query]);
+  }, [shortcuts, keyboardPrefs, hubEnabled, query, t]);
 
   return (
     <div className="cheat-sheet-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="cheat-sheet">
         <div className="cheat-sheet__header">
-          <h2 className="cheat-sheet__title">Keyboard Shortcuts</h2>
+          <h2 className="cheat-sheet__title">{t('settings.keyboard.title', 'Keyboard Shortcuts')}</h2>
           <input
             ref={inputRef}
             className="cheat-sheet__search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Filter shortcuts…"
+            placeholder={t('cheatSheet.filterPlaceholder', 'Filter shortcuts…')}
           />
-          <button className="cheat-sheet__close" onClick={onClose} title="Close (Esc)">×</button>
+          <button className="cheat-sheet__close" onClick={onClose} title={t('cheatSheet.closeTitle', 'Close (Esc)')}>×</button>
         </div>
         <div className="cheat-sheet__body">
           {grouped.length === 0 ? (
-            <div className="cheat-sheet__empty">No shortcuts match “{query}”.</div>
+            <div className="cheat-sheet__empty">{t('cheatSheet.noMatch', 'No shortcuts match "{query}".').replace('{query}', query)}</div>
           ) : (
             grouped.map((group) => (
               <div key={group.category} className="cheat-sheet__group">
-                <h3 className="cheat-sheet__group-title">{group.category}</h3>
+                <h3 className="cheat-sheet__group-title">{t(CATEGORY_LABEL_KEY[group.category] ?? 'cheatSheet.category.other', group.category)}</h3>
                 {group.rows.map((row) => (
                   <div key={`${row.category}:${row.label}`} className="cheat-sheet__row">
                     <span className="cheat-sheet__label">{row.label}</span>
