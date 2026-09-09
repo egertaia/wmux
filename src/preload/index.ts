@@ -46,6 +46,15 @@ contextBridge.exposeInMainWorld('wmux', {
     getVersion: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_VERSION),
     toggleDevTools: () => ipcRenderer.send('toggle-devtools'),
     pickFolder: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_PICK_FOLDER),
+    // Restart Explorer with its icon cache cleared (issues #137/#226). Main
+    // puts up the confirm itself — the dialog names the cost (File Explorer
+    // windows close) and the renderer cannot be trusted to have said it.
+    refreshIconCache: (): Promise<{ ran: boolean }> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_REFRESH_ICON_CACHE),
+    // True exactly once per process, on the first launch after an update that
+    // changed the app icon — the renderer turns it into a bell notification.
+    takeIconChangeNotice: (): Promise<boolean> =>
+      ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_TAKE_ICON_CHANGE_NOTICE),
     getContextMenu: () => ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_GET_CONTEXT_MENU) as Promise<boolean>,
     setContextMenu: (enabled: boolean, label?: string) =>
       ipcRenderer.invoke(IPC_CHANNELS.SYSTEM_SET_CONTEXT_MENU, enabled, label) as Promise<{

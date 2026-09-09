@@ -206,6 +206,17 @@ function pruneAutoBackups(): void {
  * no stale handles to freeze. The last-session pointer is preserved too, so the
  * user can reload their last named session after an update.
  */
+/**
+ * The version that last ran on this machine, '' on a fresh install. Read it
+ * BEFORE `handleVersionChange`, which overwrites the file — the stale-icon
+ * notice (#226) needs "was this an upgrade" and that is the only record.
+ */
+export function savedVersion(): string {
+  try {
+    return fs.existsSync(VERSION_FILE) ? fs.readFileSync(VERSION_FILE, 'utf-8').trim() : '';
+  } catch { return ''; }
+}
+
 export function handleVersionChange(currentVersion: string): boolean {
   ensureDirectories();
   try {

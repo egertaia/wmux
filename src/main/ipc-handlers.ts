@@ -28,6 +28,7 @@ import { parseWindowsTerminalConfig, parseGhosttyConfig, loadProjectProfiles, im
 import { loadUserConfig, getConfigPath, resetConfigWarnings } from './user-config';
 import { loadUserLocales } from './user-locales';
 import { WindowManager, supportsBackdropMaterial, supportsTransparency, toWindowMaterial } from './window-manager';
+import { refreshShellIconCache, takeIconChangeNotice } from './icon-cache';
 import { CDPBridge } from './cdp-bridge';
 import { CDPProxy } from './cdp-proxy';
 import { AgentManager } from './agent-manager';
@@ -1424,6 +1425,30 @@ export function registerIpcHandlers(windowManager: WindowManager, cdpProxyInstan
       return { ok: false, enabled: isContextMenuInstalled(), error: (err as Error).message };
     }
   });
+
+  // Windows shell icon cache (issues #137/#226). The confirm lives HERE, not in
+  // the renderer: the action closes every File Explorer window the user has
+  // open, and the process that does it must be the one that said so.
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_REFRESH_ICON_CACHE, async (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;
+    const { response } = await dialog.showMessageBox(win as BrowserWindow, {
+      type: 'warning',
+      title: 'wmux',
+      message: 'Restart Windows Explorer to refresh the icon cache?',
+      detail:
+        'The taskbar disappears for a second and any open File Explorer windows close. ' +
+        'Your terminals and wmux itself are not affected. This is the only way Windows ' +
+        'lets a taskbar or pinned button pick up a changed icon.',
+      buttons: ['Restart Explorer', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response !== 0) return { ran: false };
+    refreshShellIconCache();
+    return { ran: true };
+  });
+  ipcMain.handle(IPC_CHANNELS.SYSTEM_TAKE_ICON_CHANGE_NOTICE, () => takeIconChangeNotice());
 
   ipcMain.handle(IPC_CHANNELS.SYSTEM_PICK_FOLDER, async (event) => {
     const win = BrowserWindow.fromWebContents(event.sender) ?? undefined;

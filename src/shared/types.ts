@@ -650,6 +650,10 @@ export const IPC_CHANNELS = {
   SYSTEM_GET_CONTEXT_MENU: 'system:getContextMenu',
   SYSTEM_SET_CONTEXT_MENU: 'system:setContextMenu',
   SYSTEM_GET_SHOULD_USE_DARK_COLORS: 'system:getShouldUseDarkColors',
+  // Windows shell icon cache (issues #137/#226): the Explorer restart behind a
+  // native confirm, and the once-per-update "your taskbar may lag" notice.
+  SYSTEM_REFRESH_ICON_CACHE: 'system:refreshIconCache',
+  SYSTEM_TAKE_ICON_CHANGE_NOTICE: 'system:takeIconChangeNotice',
   SYSTEM_NATIVE_THEME_UPDATED: 'system:nativeThemeUpdated',
   // Metadata events (main → renderer)
   METADATA_UPDATE: 'metadata:update',

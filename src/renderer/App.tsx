@@ -745,6 +745,31 @@ export default function App() {
     return () => { try { unsub?.(); } catch { /* no-op */ } };
   }, []);
 
+  // First launch after an update that changed the app icon (issues #137/#226):
+  // the taskbar may keep drawing the old one until Explorer restarts, and the
+  // person who can trigger that needs to know the button exists. Asked once,
+  // here, rather than pushed from main — main decided at startup, before this
+  // page existed, and a push would have raced the listener.
+  useEffect(() => {
+    const take = window.wmux?.system?.takeIconChangeNotice;
+    if (!take) return;
+    let cancelled = false;
+    take().then((due: boolean) => {
+      if (!due || cancelled) return;
+      const st = useStore.getState();
+      const ws = st.workspaces.find((w) => w.id === st.activeWorkspaceId) ?? st.workspaces[0];
+      if (!ws) return;
+      addNotification({
+        surfaceId: '' as SurfaceId,
+        workspaceId: ws.id,
+        title: t('notification.iconChanged.title', 'wmux has a new icon'),
+        text: t('notification.iconChanged.text',
+          'If the taskbar or a pinned button still shows the old one, use Settings → General → Refresh taskbar icons.'),
+      });
+    }).catch(() => { /* no main, or an old preload */ });
+    return () => { cancelled = true; };
+  }, []);
+
   // Listen for agent spawn events from main process
   useEffect(() => {
     if (!window.wmux?.agent?.onUpdate) return;

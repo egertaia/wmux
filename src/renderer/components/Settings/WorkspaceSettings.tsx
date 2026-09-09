@@ -229,6 +229,22 @@ export default function WorkspaceSettings() {
       </p>
 
       <div className="settings-row">
+        <label className="settings-label">{t('settings.workspacePanel.confirmAppClose', 'Confirm before closing wmux')}</label>
+        <input
+          type="checkbox"
+          className="settings-toggle"
+          checked={workspacePrefs.confirmAppClose}
+          onChange={(e) => setWorkspacePrefs({ confirmAppClose: e.target.checked })}
+        />
+      </div>
+      <p className="settings-hint">
+        {t(
+          'settings.workspacePanel.confirmAppCloseHint',
+          "Ask before the window's × button or Alt+F4 quits wmux — closing the window ends every terminal session in it, agents included. Updates, restarts and Windows shutdown never prompt.",
+        )}
+      </p>
+
+      <div className="settings-row">
         <label className="settings-label">{t('settings.workspacePanel.restoreClaudeSessions', 'Resume Claude Code sessions on restore')}</label>
         <input
           type="checkbox"

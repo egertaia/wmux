@@ -21,7 +21,8 @@ import { PortScanner } from './port-scanner';
 import { CDPProxy } from './cdp-proxy';
 import { IPC_CHANNELS, SurfaceId, BrowserEngine } from '../shared/types';
 import { getPipePath, getAppDataDir, ensurePipeToken, getAppUserModelId } from '../shared/instance';
-import { loadSession, saveSession, handleVersionChange, SessionData } from './session-persistence';
+import { loadSession, saveSession, handleVersionChange, savedVersion, SessionData } from './session-persistence';
+import { noteIconRevision } from './icon-cache';
 import { getAgentState, reportAgentSession } from './agent-state';
 import {
   stampClaudeSessionIds,
@@ -29,7 +30,7 @@ import {
   listKnownTranscriptIds,
 } from './claude-resume';
 import { sessionWindows, MAX_RESTORED_WINDOWS } from './session-windows';
-import { WindowManager } from './window-manager';
+import { WindowManager, appIconCandidates } from './window-manager';
 import { initAutoUpdater, requestUpdateNow, getUpdateState } from './updater';
 import { initUpdateChecker, getLatestUpdate } from './update-checker';
 import { getChangelog } from './changelog';
@@ -1016,7 +1017,15 @@ app.whenReady().then(() => {
   });
 
   // Clear stale session data on version change (clean start for upgrades/fresh installs)
+  const previousVersion = savedVersion();
   handleVersionChange(app.getVersion());
+  // Did this update change the app icon? If so the taskbar may still draw the
+  // old one (issues #137/#226) — the renderer asks for this once and turns it
+  // into a bell notification pointing at Settings → General.
+  noteIconRevision({
+    iconPath: appIconCandidates().find((p) => p.toLowerCase().endsWith('.ico')),
+    upgraded: previousVersion !== '' && previousVersion !== app.getVersion(),
+  });
 
   // Reopen every window the last session had, not just the first (issue #118).
   // Each gets its own slot in the registry so its renderer restores its own
@@ -1761,6 +1770,23 @@ app.on('before-quit', () => {
 // is attached centrally here rather than at each creation site, and made
 // one-shot: the OS ends the session once, however many windows are open.
 let sessionEndHandled = false;
+
+// Close-window guard (issue #227). The pref is read off settings.json at close
+// time, not cached: the renderer writes it there synchronously on toggle, and a
+// read per × click is nothing. Bypassed whenever the app is quitting on its own
+// account — an update installing, a relaunch, Windows ending the session —
+// because a modal there blocks an update or a shutdown.
+windowManager.closeGuard = {
+  enabled: () => {
+    try {
+      const prefs = loadSettings()['wmux-workspace-prefs'] as { confirmAppClose?: unknown } | undefined;
+      return prefs?.confirmAppClose === true;
+    } catch { return false; }
+  },
+  bypass: () => isQuitting || sessionEndHandled,
+  ptyCount: () => ptyManager.count(),
+};
+
 app.on('browser-window-created', (_event, win) => {
   win.on('session-end', () => {
     if (sessionEndHandled) return;

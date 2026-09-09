@@ -42,6 +42,15 @@ export const en = {
   'settings.general.contextMenuHint':
     'Right-click a folder — or its empty space — to open it as a workspace, instead of pasting the path. On Windows 11 it appears under "Show more options" (Shift+F10); the modern top-level menu requires a signed MSIX package. Writes only to HKCU, so no admin rights are needed.',
   'settings.general.contextMenuFailed': 'Could not update the context menu entry.',
+  // Settings — General panel — Windows icon cache (issues #137/#226)
+  'settings.general.iconCache': 'Taskbar still showing the old wmux icon?',
+  'settings.general.iconCacheButton': 'Refresh taskbar icons',
+  'settings.general.iconCacheStarted': 'Explorer is restarting…',
+  'settings.general.iconCacheHint':
+    'Windows caches shell icons and only re-reads them when Explorer restarts, so after an update that changed the icon, the taskbar and a pinned button can keep drawing the old one while the window and notifications already show the new one. This restarts Explorer with that cache cleared: the taskbar disappears for a second and any open File Explorer windows close. Your terminals are not affected.',
+  'notification.iconChanged.title': 'wmux has a new icon',
+  'notification.iconChanged.text':
+    'If the taskbar or a pinned button still shows the old one, use Settings → General → Refresh taskbar icons.',
   // Settings — General panel — Custom background (issue #89)
   'settings.general.customBgSection': 'Custom background',
   'settings.general.customBgEnable': 'Enable custom background',
@@ -529,6 +538,9 @@ export const en = {
   'settings.workspacePanel.confirmClose': 'Confirm before closing a session',
   'settings.workspacePanel.confirmCloseHint':
     "Ask before the × button, the context menu or Ctrl+Shift+W closes a session — a stray click can't take down agents that haven't saved their state yet. Closes from the CLI and agents never prompt.",
+  'settings.workspacePanel.confirmAppClose': 'Confirm before closing wmux',
+  'settings.workspacePanel.confirmAppCloseHint':
+    "Ask before the window's × button or Alt+F4 quits wmux — closing the window ends every terminal session in it, agents included. Updates, restarts and Windows shutdown never prompt.",
   'settings.workspacePanel.restoreClaudeSessions': 'Resume Claude Code sessions on restore',
   'settings.workspacePanel.restoreClaudeSessionsHint': 'When wmux restores a session, re-launch each terminal that was running Claude Code with `claude --resume`, in the directory it was in. Off by default: every such pane starts an agent at once. Panes whose conversation Claude no longer has are skipped, and a Claude you exited cleanly is not resumed.',
   'settings.workspacePanel.autoOpenDiff': 'Auto-open diff tab on agent edits',

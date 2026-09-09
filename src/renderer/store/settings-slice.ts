@@ -371,6 +371,16 @@ export interface WorkspacePrefs {
    */
   confirmWorkspaceClose: boolean;
   /**
+   * Ask before the WINDOW closes (issue #227): the caption ×, Alt+F4 or the
+   * closeWindow shortcut ends every PTY in the window, agents included, and
+   * on a loaded machine the click is not even aimed. Opt-in like the one
+   * above. Decided in MAIN (`close-guard.ts`), which reads this off
+   * settings.json at close time — the renderer may be the unresponsive part.
+   * Programmatic quits (update install, relaunch, Windows shutdown) and
+   * `wmux close-window` never prompt.
+   */
+  confirmAppClose: boolean;
+  /**
    * Read agent TUIs off the screen to infer blocked/working/idle for agents
    * that do not report state themselves (Codex, Gemini, Aider, …).
    *
@@ -438,6 +448,7 @@ export const DEFAULT_WORKSPACE_PREFS: WorkspacePrefs = {
   showWelcomeScreen: true,
   autoOpenDiffTab: true,
   confirmWorkspaceClose: false,
+  confirmAppClose: false,
   defaultLayoutId: null,
   restoreClaudeSessions: false,
   detectAgentScreens: true,
